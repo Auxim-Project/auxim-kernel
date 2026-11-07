@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   package:
@@ -59,19 +60,17 @@ jobs:
           path: artifacts/packages/Auxim.Kernel.*.nupkg
           if-no-files-found: error
 
-      - name: Require NuGet API key
+      - name: Log in to NuGet.org with Trusted Publishing
+        id: login
         if: ${{ inputs.publish }}
-        shell: bash
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          if [[ -z "$NUGET_API_KEY" ]]; then
-            echo "NUGET_API_KEY is required when publish is enabled." >&2
-            exit 1
-          fi
+        uses: NuGet/login@v1
+        with:
+          user: F4561F
 
       - name: Publish to NuGet.org
         if: ${{ inputs.publish }}
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: dotnet nuget push "artifacts/packages/Auxim.Kernel.*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: |
+          dotnet nuget push "artifacts/packages/Auxim.Kernel.*.nupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
