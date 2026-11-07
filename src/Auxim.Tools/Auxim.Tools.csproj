@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Auxim.Core\Auxim.Core.csproj" />
+    <ProjectReference Include="..\Auxim.VAFS\Auxim.VAFS.csproj" />
+  </ItemGroup>
+</Project>

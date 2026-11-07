@@ -1,0 +1,45 @@
+<Project>
+  <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Auxim.Kernel</PackageId>
+    <Authors>F4561F</Authors>
+    <Description>Trusted execution and resource-control foundation for Auxim agents.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/F4561F/auxim-kernel</RepositoryUrl>
+    <PackageTags>auxim;agent;runtime;kernel;security</PackageTags>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <CopyBuildOutputToOutputDirectory>false</CopyBuildOutputToOutputDirectory>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);AddKernelAssembliesToPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Auxim.Core/Auxim.Core.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="../Auxim.Tools/Auxim.Tools.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="../Auxim.VAFS/Auxim.VAFS.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+  <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+  <Target Name="CoreCompile" />
+  <Target Name="BuiltProjectOutputGroup" />
+  <Target Name="DebugSymbolsProjectOutputGroup" />
+  <Target Name="AddKernelAssembliesToPackage">
+    <ItemGroup>
+      <KernelAssembly Include="$(MSBuildThisFileDirectory)../Auxim.Core/bin/$(Configuration)/$(TargetFramework)/Auxim.Core.dll" />
+      <KernelAssembly Include="$(MSBuildThisFileDirectory)../Auxim.Tools/bin/$(Configuration)/$(TargetFramework)/Auxim.Tools.dll" />
+      <KernelAssembly Include="$(MSBuildThisFileDirectory)../Auxim.VAFS/bin/$(Configuration)/$(TargetFramework)/Auxim.VAFS.dll" />
+    </ItemGroup>
+    <Error Condition="!Exists('%(KernelAssembly.Identity)')" Text="Missing Kernel assembly: %(KernelAssembly.Identity)" />
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(KernelAssembly)">
+        <FinalOutputPath>%(Identity)</FinalOutputPath>
+        <TargetPath>%(Filename)%(Extension)</TargetPath>
+      </BuildOutputInPackage>
+    </ItemGroup>
+  </Target>
+</Project>

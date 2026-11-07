@@ -1,0 +1,39 @@
+# .NET build and test output
+bin/
+obj/
+artifacts/
+TestResults/
+*.trx
+coverage/
+coverage.*
+
+# NuGet output
+*.nupkg
+*.snupkg
+*.binlog
+packages/
+
+# IDE and editor state
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.DotSettings.user
+*.swp
+*.swo
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.json
+*.secret.json
+secrets.json
+
+# Operating-system files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
