@@ -8,7 +8,7 @@
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <RepositoryType>git</RepositoryType>
-    <RepositoryUrl>https://github.com/F4561F/auxim-kernel</RepositoryUrl>
+    <RepositoryUrl>https://github.com/Auxim-Project/auxim-kernel</RepositoryUrl>
     <PackageTags>auxim;agent;runtime;kernel;security</PackageTags>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
