@@ -78,10 +78,7 @@ internal sealed class VafsResourcePermissionPolicy
                 throw new UnauthorizedAccessException($"Tool '{toolName}' declared an unsupported VAFS access.");
             }
 
-            if (!_permissions.Any(permission => permission.Action == access.Action
-                && (!access.IncludeDescendants || permission.IncludeDescendants)
-                && (permission.VirtualPath == path || (permission.IncludeDescendants
-                    && IsSameOrBelow(path, permission.VirtualPath, StringComparison.Ordinal)))))
+            if (!_permissions.Any(permission => Covers(permission, access.Action, path, access.IncludeDescendants)))
             {
                 throw new UnauthorizedAccessException($"Tool '{toolName}' is not allowed to {access.Action} '{path}'.");
             }
@@ -94,6 +91,71 @@ internal sealed class VafsResourcePermissionPolicy
                 {
                     throw new UnauthorizedAccessException($"Restricted VAFS writes require an existing parent directory for '{path}'.");
                 }
+            }
+        }
+    }
+
+    internal static IReadOnlyList<VafsResourcePermission> DeriveChildPermissions(
+        ExecutionResourceDomain domain,
+        IReadOnlyList<VafsResourcePermission>? parentPermissions,
+        IReadOnlyList<VafsResourcePermission>? requestedPermissions)
+    {
+        if (parentPermissions is null)
+        {
+            var grants = new List<VafsResourcePermission>
+            {
+                new(ResourceAction.Read, "/"),
+                new(ResourceAction.Read, "/volumes"),
+            };
+            foreach (var mount in domain.Mounts)
+            {
+                grants.Add(new(ResourceAction.Read, mount.VirtualPath, IncludeDescendants: true));
+                if (!mount.ReadOnly)
+                {
+                    grants.Add(new(ResourceAction.Write, mount.VirtualPath, IncludeDescendants: true));
+                }
+            }
+
+            parentPermissions = grants;
+        }
+
+        var delegable = parentPermissions.Where(permission =>
+            !IsSameOrBelow(permission.VirtualPath, "/tmp", StringComparison.Ordinal)
+            && (permission.Action != ResourceAction.Write || !domain.Mounts.Any(mount =>
+                mount.ReadOnly && IsSameOrBelow(permission.VirtualPath, mount.VirtualPath, StringComparison.Ordinal))))
+            .ToArray();
+        if (requestedPermissions is null)
+        {
+            return Array.AsReadOnly(delegable);
+        }
+
+        foreach (var permission in requestedPermissions)
+        {
+            if (permission is null || !IsSupported(permission.Action, permission.VirtualPath, permission.IncludeDescendants))
+            {
+                throw new ArgumentException(
+                    "ResourcePermissions require read or write actions and canonical VAFS paths. Synthetic roots allow only exact reads.",
+                    nameof(requestedPermissions));
+            }
+
+            if (!delegable.Any(grant => Covers(grant, permission.Action, permission.VirtualPath, permission.IncludeDescendants)))
+            {
+                throw new UnauthorizedAccessException(
+                    $"The parent cannot delegate {permission.Action} access to '{permission.VirtualPath}'.");
+            }
+        }
+
+        return requestedPermissions;
+    }
+
+    internal void EnsureSharedMountsMatch(VafsResourcePermissionPolicy parent)
+    {
+        foreach (var mount in _mounts)
+        {
+            if (mount.VirtualPath != "/tmp"
+                && !parent._mounts.Any(other => other.VirtualPath == mount.VirtualPath && other.PhysicalPath == mount.PhysicalPath))
+            {
+                throw new VirtualPathException($"The mount for delegated VAFS path '{mount.VirtualPath}' changed.");
             }
         }
     }
@@ -121,6 +183,12 @@ internal sealed class VafsResourcePermissionPolicy
         (action == ResourceAction.Read || action == ResourceAction.Write)
         && IsCanonicalPath(path)
         && (!IsSyntheticRoot(path) || (action == ResourceAction.Read && !includeDescendants));
+
+    private static bool Covers(VafsResourcePermission permission, ResourceAction action, string path, bool includeDescendants) =>
+        permission.Action == action
+        && (!includeDescendants || permission.IncludeDescendants)
+        && (permission.VirtualPath == path || (permission.IncludeDescendants
+            && IsSameOrBelow(path, permission.VirtualPath, StringComparison.Ordinal)));
 
     private static bool IsCanonicalPath(string path)
     {

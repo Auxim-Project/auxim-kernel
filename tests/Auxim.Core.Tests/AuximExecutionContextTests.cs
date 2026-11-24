@@ -112,7 +112,7 @@ public sealed class AuximExecutionContextTests : IDisposable
         Assert.NotEqual(firstContext.ExecutionId.ToString(), firstContext.RunId.Value);
         Assert.Empty(first.SessionId);
         Assert.Empty(second.SessionId);
-        AssertEvents(firstEvents, first, "first");
+        AssertEvents(firstEvents, first, "first", deniedTool: "new-tool");
         AssertEvents(secondEvents, second, "second");
         Assert.Equal(first.RunId.Value, Assert.Single(firstApprovals.Requests).RunId);
         Assert.Equal(second.RunId.Value, Assert.Single(secondApprovals.Requests).RunId);
@@ -188,7 +188,11 @@ public sealed class AuximExecutionContextTests : IDisposable
         Assert.False(protectedHandlerRan);
         Assert.Empty(new ToolApprovalService(_home).ListGrants());
         Assert.Equal("canceled", Assert.Single(events.OfType<RuntimeToolCompletedEvent>()).Outcome);
-        Assert.IsType<RuntimeRunFailedEvent>(events.Last());
+        var failed = Assert.Single(events.OfType<RuntimeRunFailedEvent>());
+        Assert.Same(failed, events.Last());
+        Assert.True(failed.IsCanceled);
+        Assert.Null(failed.ParentExecutionId);
+        Assert.Empty(events.OfType<RuntimeRunCompletedEvent>());
         AssertEventIdentity(events);
         Assert.False(otherRun.IsCompleted);
         otherMayFinish.SetResult();
@@ -464,6 +468,8 @@ public sealed class AuximExecutionContextTests : IDisposable
         var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
         {
             Assert.Equal("read.allowed", Assert.Single(context.ListTools()).Name);
+            Assert.Equal("read.allowed", Assert.Single(context.ToolRebinders).Key);
+            Assert.True(context.ToolRebinders.ContainsKey("READ.ALLOWED"));
             var access = Assert.Single(context.ResolveToolResourceAccesses("READ.ALLOWED", NoArguments));
             Assert.Equal("test:allowed", access.Resource.Value);
             foreach (var name in new[] { "write.denied", "unbound", "unknown" })
@@ -494,12 +500,14 @@ public sealed class AuximExecutionContextTests : IDisposable
             if (denyAll)
             {
                 Assert.Empty(context.ListTools());
+                Assert.Empty(context.ToolRebinders);
                 Assert.Throws<InvalidOperationException>(() => context.ResolveToolResourceAccesses("echo", NoArguments));
                 await Assert.ThrowsAsync<InvalidOperationException>(() => context.InvokeToolAsync("echo", NoArguments));
                 return new AgentResult("denied", []);
             }
 
             Assert.Equal("echo", Assert.Single(context.ListTools()).Name);
+            Assert.Equal("echo", Assert.Single(context.ToolRebinders).Key);
             Assert.Empty(context.ResolveToolResourceAccesses("echo", NoArguments));
             return new AgentResult(await context.InvokeToolAsync("echo", NoArguments), []);
         }), new RuntimeToolService(() => registry));
@@ -509,6 +517,68 @@ public sealed class AuximExecutionContextTests : IDisposable
             AllowedToolNames = denyAll ? [] : null,
         });
         Assert.Equal(denyAll ? "denied" : "echo", result.FinalResponse);
+    }
+
+    [Fact]
+    public async Task BinderCanReplaceAnUnserializableOriginalSchema()
+    {
+        var registry = new ToolRegistry();
+        var definition = new ToolDefinition("echo", "test", "", (_, _) => Task.FromResult("unbound"))
+        {
+            ParametersSchema = new Dictionary<string, object?> { ["unsupported"] = (Func<string>)(() => "unused") },
+        };
+        registry.Register(definition with
+        {
+            ResourceViewBinder = _ => definition with
+            {
+                Handler = (_, _) => Task.FromResult("bound"),
+                ParametersSchema = new Dictionary<string, object?> { ["type"] = "object" },
+            },
+        });
+        var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
+        {
+            var tool = Assert.Single(context.ListTools());
+            Assert.Equal("echo", tool.Name);
+            Assert.Equal("object", Assert.IsType<JsonElement>(tool.ParametersSchema["type"]).GetString());
+            Assert.Null(context.ToolRebinders["ECHO"]);
+            return new AgentResult(await context.InvokeToolAsync("ECHO", NoArguments), []);
+        }), new RuntimeToolService(() => registry));
+
+        Assert.Equal("bound", (await runtime.RunInContextAsync("run")).FinalResponse);
+    }
+
+    [Fact]
+    public async Task MutableCustomBinderIsNotRetainedForRebinding()
+    {
+        var values = new List<string> { "original" };
+        var response = "bound";
+        var registry = new ToolRegistry();
+        var definition = new ToolDefinition("echo", "test", "", (_, _) => Task.FromResult("unbound"))
+        {
+            ParametersSchema = new Dictionary<string, object?> { ["enum"] = values },
+        };
+        definition = definition with
+        {
+            ResourceViewBinder = _ =>
+            {
+                var capturedResponse = response;
+                return definition with { Handler = (_, _) => Task.FromResult(capturedResponse) };
+            },
+        };
+        registry.Register(definition);
+        var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
+        {
+            values[0] = "changed";
+            response = "changed";
+            registry.Register(new ToolDefinition("echo", "test", "", (_, _) => Task.FromResult("replacement")));
+
+            Assert.Null(context.ToolRebinders["ECHO"]);
+            var boundSchema = Assert.Single(context.ListTools()).ParametersSchema;
+            Assert.Equal("original", Assert.IsType<JsonElement>(boundSchema["enum"])[0].GetString());
+            return new AgentResult(await context.InvokeToolAsync("echo", NoArguments), []);
+        }), new RuntimeToolService(() => registry));
+
+        Assert.Equal("bound", (await runtime.RunInContextAsync("run")).FinalResponse);
     }
 
     [Theory]
@@ -802,11 +872,20 @@ public sealed class AuximExecutionContextTests : IDisposable
     };
 
     private static void AssertEvents(
-        ConcurrentQueue<RuntimeEvent> events, RuntimeRunStartedEvent started, string delta)
+        ConcurrentQueue<RuntimeEvent> events, RuntimeRunStartedEvent started, string delta, string? deniedTool = null)
     {
+        IEnumerable<RuntimeEvent> successfulEvents = events;
+        if (deniedTool is not null)
+        {
+            var denial = Assert.IsType<RuntimeToolCompletedEvent>(events.ElementAt(1));
+            Assert.Equal(deniedTool, denial.ToolName);
+            Assert.Equal("denied", denial.Outcome);
+            successfulEvents = events.Where(value => value != denial);
+        }
+
         Assert.Equal(
             ["run.started", "content.delta", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "run.completed"],
-            events.Select(value => value.Kind));
+            successfulEvents.Select(value => value.Kind));
         Assert.All(events, value =>
         {
             Assert.Equal(started.ExecutionId, value.ExecutionId);
@@ -814,7 +893,7 @@ public sealed class AuximExecutionContextTests : IDisposable
         });
         Assert.Equal(delta, Assert.Single(events.OfType<RuntimeContentDeltaEvent>()).Delta);
         Assert.Equal(Assert.Single(events.OfType<RuntimeToolStartedEvent>()).ToolCallId,
-            Assert.Single(events.OfType<RuntimeToolCompletedEvent>()).ToolCallId);
+            Assert.Single(successfulEvents.OfType<RuntimeToolCompletedEvent>()).ToolCallId);
     }
 
     private static void AssertEventIdentity(ConcurrentQueue<RuntimeEvent> events)

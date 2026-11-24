@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Collections.ObjectModel;
 using System.Text.Json;
 using Auxim.Core.Approval;
@@ -5,6 +6,7 @@ using Auxim.Core.Config;
 using Auxim.Core.Logging;
 using Auxim.Core.Resources;
 using Auxim.Core.Tools;
+using Auxim.VAFS;
 
 namespace Auxim.Core.Runtime;
 
@@ -24,6 +26,7 @@ public sealed class AuximExecutionContext
     private readonly ExecutionResourceView _resources;
     private readonly IReadOnlyList<AuximRuntimeTool> _catalog;
     private readonly ToolExecutionCoordinator _tools;
+    private readonly VafsResourcePermissionPolicy? _resourcePolicy;
     private readonly CancellationTokenSource _lifetime;
     private readonly CancellationTokenRegistration _callerCancellation;
     private readonly object _gate = new();
@@ -35,47 +38,59 @@ public sealed class AuximExecutionContext
     private Task? _cancellation;
 
     internal AuximExecutionContext(
+        object owner,
         AuximConfig configuration,
         ExecutionResourceView resources,
-        ToolRegistry registry,
-        IReadOnlySet<string>? allowedToolNames,
+        IEnumerable<(string Name, Func<VirtualAgentFileSystem, ToolDefinition> Bind, bool CanRebind)> toolBindings,
         IReadOnlyList<VafsResourcePermission>? resourcePermissions,
         string homeDirectory,
         IApprovalHandler approvalHandler,
         IRuntimeEventSink eventSink,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        VafsResourcePermissionPolicy? parentResourcePolicy = null,
+        AuximExecutionId? parentExecutionId = null)
     {
+        Owner = owner;
         _configuration = configuration;
         _resources = resources;
-        var resourcePolicy = resourcePermissions is null
+        HomeDirectory = homeDirectory;
+        ApprovalHandler = approvalHandler;
+        UnscopedEventSink = eventSink;
+        ResourcePermissions = resourcePermissions;
+        _resourcePolicy = resourcePermissions is null
             ? null
             : new VafsResourcePermissionPolicy(resources.FileSystem, resourcePermissions);
-        var snapshot = new ToolRegistry();
-        foreach (var definition in registry.List())
+        if (parentResourcePolicy is not null)
         {
-            if ((allowedToolNames is not null && !allowedToolNames.Contains(definition.Name))
-                || definition.ResourceViewBinder is not { } bind)
-            {
-                continue;
-            }
-
-            var bound = bind(resources.FileSystem);
-            if (!string.Equals(definition.Name, bound.Name, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException($"Resource binding changed the name of tool '{definition.Name}'.");
-            }
-
-            snapshot.Register(bound with
-            {
-                ParametersSchema = SnapshotSchema(bound.ParametersSchema),
-                ResourceViewBinder = null,
-            });
+            _resourcePolicy!.EnsureSharedMountsMatch(parentResourcePolicy);
         }
 
+        var snapshot = new ToolRegistry();
+        var toolRebinders = new Dictionary<string, Func<VirtualAgentFileSystem, ToolDefinition>?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, bind, canRebind) in toolBindings)
+        {
+            var bound = bind(resources.FileSystem);
+            if (!string.Equals(name, bound.Name, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Resource binding changed the name of tool '{name}'.");
+            }
+
+            var boundSchema = SnapshotSchema(bound.ParametersSchema);
+            snapshot.Register(bound with
+            {
+                ParametersSchema = boundSchema,
+                ResourceViewBinder = null,
+            });
+            toolRebinders.Add(name, canRebind
+                ? view => bind(view) with { ParametersSchema = boundSchema, ResourceViewBinder = null }
+                : null);
+        }
+
+        ToolRebinders = toolRebinders.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
         _catalog = Array.AsReadOnly(RuntimeToolService.DescribeTools(snapshot).ToArray());
         EventSink = new DelegateRuntimeEventSink(async (runtimeEvent, token) =>
         {
-            var contextualEvent = runtimeEvent with { ExecutionId = ExecutionId };
+            var contextualEvent = runtimeEvent with { ExecutionId = ExecutionId, ParentExecutionId = parentExecutionId };
             if (runtimeEvent is RuntimeRunCompletedEvent or RuntimeRunFailedEvent or RuntimeToolCompletedEvent)
             {
                 try
@@ -96,7 +111,7 @@ public sealed class AuximExecutionContext
             await eventSink.PublishAsync(contextualEvent, token);
         });
         _tools = new ToolExecutionCoordinator(snapshot, homeDirectory, approvalHandler, EventSink,
-            allowRememberedGrants: false, resourcePolicy: resourcePolicy);
+            allowRememberedGrants: false, resourcePolicy: _resourcePolicy, reportPreflightFailures: true);
         _lifetime = new CancellationTokenSource();
         CancellationToken = _lifetime.Token;
         _callerCancellation = cancellationToken.UnsafeRegister(static state =>
@@ -118,6 +133,24 @@ public sealed class AuximExecutionContext
     public CancellationToken CancellationToken { get; }
 
     internal IRuntimeEventSink EventSink { get; }
+
+    internal object Owner { get; }
+
+    internal string HomeDirectory { get; }
+
+    internal IApprovalHandler ApprovalHandler { get; }
+
+    internal IRuntimeEventSink UnscopedEventSink { get; }
+
+    internal ExecutionResourceDomain ResourceDomain => _resources.Domain;
+
+    // The keys are the effective tool allowlist. A null entry has no trusted rebinder.
+    internal IReadOnlyDictionary<string, Func<VirtualAgentFileSystem, ToolDefinition>?> ToolRebinders { get; }
+
+    internal IReadOnlyList<VafsResourcePermission>? ResourcePermissions { get; }
+
+    internal VafsResourcePermissionPolicy GetDelegationResourcePolicy() =>
+        _resourcePolicy ?? new VafsResourcePermissionPolicy(_resources.FileSystem, []);
 
     /// <summary>Lists metadata from the bound tool catalog. Schema values are immutable JSON.</summary>
     public IReadOnlyList<AuximRuntimeTool> ListTools()
@@ -233,7 +266,7 @@ public sealed class AuximExecutionContext
         }
     }
 
-    private void BeginOperation()
+    internal void BeginOperation()
     {
         lock (_gate)
         {
@@ -242,7 +275,7 @@ public sealed class AuximExecutionContext
         }
     }
 
-    private void EndOperation()
+    internal void EndOperation()
     {
         lock (_gate)
         {

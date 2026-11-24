@@ -2,6 +2,12 @@ namespace Auxim.Core.Runtime;
 
 public interface IAgentRunner
 {
+    /// <summary>
+    /// Indicates that this runner can execute overlapping context runs on the same instance,
+    /// including when a parent awaits a child run.
+    /// </summary>
+    bool SupportsConcurrentContextExecutions => false;
+
     Task<AgentResult> RunAsync(
         AgentRunRequest request,
         CancellationToken cancellationToken = default);

@@ -8,7 +8,7 @@ public static class FileTools
 {
     public static void Register(ToolRegistry registry)
     {
-        RegisterFileTool(registry, view => new ToolDefinition(
+        RegisterFileTool(registry, static view => new ToolDefinition(
             "file.read",
             "files",
             "Reads a UTF-8 text file under /workspace, /tmp, or mounted /volumes paths.",
@@ -23,7 +23,7 @@ public static class FileTools
                 [FileAccess(view, Required(args, "path"), ResourceAction.Read)],
         });
 
-        RegisterFileTool(registry, view => new ToolDefinition(
+        RegisterFileTool(registry, static view => new ToolDefinition(
             "file.write",
             "files",
             "Writes UTF-8 text to a file under writable /workspace, /tmp, or mounted /volumes paths.",
@@ -48,7 +48,7 @@ public static class FileTools
                 [FileAccess(view, Required(args, "path"), ResourceAction.Write)],
         });
 
-        RegisterFileTool(registry, view => new ToolDefinition(
+        RegisterFileTool(registry, static view => new ToolDefinition(
             "file.patch",
             "files",
             "Replaces exact text in a file under writable /workspace, /tmp, or mounted /volumes paths.",
@@ -89,7 +89,7 @@ public static class FileTools
             },
         });
 
-        RegisterFileTool(registry, view => new ToolDefinition(
+        RegisterFileTool(registry, static view => new ToolDefinition(
             "file.list",
             "files",
             "Lists files and directories under /workspace, /tmp, or mounted /volumes paths.",
@@ -135,7 +135,7 @@ public static class FileTools
 
     internal static void RegisterFileTool(
         ToolRegistry registry, Func<VirtualAgentFileSystem?, ToolDefinition> create) =>
-        registry.Register(create(null) with { ResourceViewBinder = view => create(view) });
+        registry.RegisterRebindableTool(create(null) with { ResourceViewBinder = view => create(view) });
 
     internal static ResourceAccess FileAccess(VirtualAgentFileSystem? view, string path, ResourceAction action)
     {

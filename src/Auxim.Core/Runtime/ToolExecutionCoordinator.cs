@@ -2,6 +2,7 @@ using Auxim.Core.Approval;
 using Auxim.Core.Logging;
 using Auxim.Core.Resources;
 using Auxim.Core.Tools;
+using Auxim.VAFS;
 
 namespace Auxim.Core.Runtime;
 
@@ -13,6 +14,7 @@ internal sealed class ToolExecutionCoordinator
     private readonly IApprovalHandler _approvalHandler;
     private readonly IRuntimeEventSink _eventSink;
     private readonly VafsResourcePermissionPolicy? _resourcePolicy;
+    private readonly bool _reportPreflightFailures;
 
     public ToolExecutionCoordinator(
         ToolRegistry tools,
@@ -20,7 +22,8 @@ internal sealed class ToolExecutionCoordinator
         IApprovalHandler approvalHandler,
         IRuntimeEventSink eventSink,
         bool allowRememberedGrants = true,
-        VafsResourcePermissionPolicy? resourcePolicy = null)
+        VafsResourcePermissionPolicy? resourcePolicy = null,
+        bool reportPreflightFailures = false)
     {
         _tools = tools;
         _approvals = new ToolApprovalService(homeDirectory, allowRememberedGrants);
@@ -28,6 +31,7 @@ internal sealed class ToolExecutionCoordinator
         _approvalHandler = approvalHandler;
         _eventSink = eventSink;
         _resourcePolicy = resourcePolicy;
+        _reportPreflightFailures = reportPreflightFailures;
     }
 
     public IReadOnlyList<ResourceAccess> ResolveResourceAccesses(
@@ -45,15 +49,23 @@ internal sealed class ToolExecutionCoordinator
         IReadOnlyDictionary<string, object?> arguments,
         CancellationToken cancellationToken)
     {
-        var definition = _tools.Get(toolName);
-        cancellationToken.ThrowIfCancellationRequested();
-        var accesses = CheckResourceAccesses(toolName, definition.ResolveResourceAccesses(arguments));
-
         ApprovalResponse approval;
         var content = "";
         var outputLength = 0;
+        var preflight = true;
+        var findingTool = true;
+        var checkingPermissions = false;
         try
         {
+            var definition = _tools.Get(toolName);
+            findingTool = false;
+            cancellationToken.ThrowIfCancellationRequested();
+            var declared = definition.ResolveResourceAccesses(arguments);
+            checkingPermissions = true;
+            var accesses = CheckResourceAccesses(toolName, declared);
+            checkingPermissions = false;
+            preflight = false;
+
             await _eventSink.PublishAsync(
                 new RuntimeToolStartedEvent(
                     RuntimeEventFactory.NewEventId(),
@@ -69,17 +81,25 @@ internal sealed class ToolExecutionCoordinator
             if (approval.Approved)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                checkingPermissions = true;
                 _resourcePolicy?.EnsureAllowed(toolName, accesses);
+                checkingPermissions = false;
                 content = await definition.Handler(arguments, cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 outputLength = content.Length;
             }
         }
-        catch (Exception exception)
+        catch (Exception exception) when (!preflight || _reportPreflightFailures)
         {
             var outcome = exception is OperationCanceledException && cancellationToken.IsCancellationRequested
                 ? "canceled"
                 : "failed";
+            if (_reportPreflightFailures && (findingTool && exception is InvalidOperationException
+                || preflight && exception is VirtualPathException { IsReadOnlyMount: true }
+                || checkingPermissions && exception is UnauthorizedAccessException or VirtualPathException))
+            {
+                outcome = "denied";
+            }
             try
             {
                 await PublishCompletedAsync(runId, toolCallId, toolName, outcome, 0, cancellationToken);

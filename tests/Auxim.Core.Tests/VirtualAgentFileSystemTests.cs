@@ -53,6 +53,23 @@ public sealed class VirtualAgentFileSystemTests : IDisposable
     }
 
     [Fact]
+    public void ResolvesDescendantsWhenWorkspaceIsAFilesystemRoot()
+    {
+        var file = Path.Combine(_workspace, "README.md");
+        var root = Path.GetPathRoot(file)!;
+        var relativePath = Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/');
+        var vafs = new VirtualAgentFileSystem(new VirtualAgentFileSystemOptions
+        {
+            WorkspaceHostPath = root,
+            TmpHostPath = _tmp,
+        });
+
+        Assert.Equal(file, vafs.ResolveToHostPath($"/workspace/{relativePath}"));
+        Assert.Equal($"/workspace/{relativePath}", vafs.ToVirtualPath(file));
+        Assert.Throws<VirtualPathException>(() => vafs.ResolveToHostPath($"/workspace/../../{relativePath}"));
+    }
+
+    [Fact]
     public void ProvidesWritableTmpMount()
     {
         var vafs = VirtualAgentFileSystem.FromEnvironment();

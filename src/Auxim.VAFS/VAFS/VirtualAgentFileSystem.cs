@@ -104,7 +104,7 @@ public sealed class VirtualAgentFileSystem
 
         if (requireWritable && mount.ReadOnly)
         {
-            throw new VirtualPathException($"Virtual mount '{mount.VirtualPath}' is read-only.");
+            throw new VirtualPathException($"Virtual mount '{mount.VirtualPath}' is read-only.", isReadOnlyMount: true);
         }
 
         var relative = RelativeVirtualPath(mount.VirtualPath, virtualPath);
@@ -275,6 +275,11 @@ public sealed class VirtualAgentFileSystem
     {
         parent = Path.TrimEndingDirectorySeparator(Path.GetFullPath(parent));
         path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        if (Path.EndsInDirectorySeparator(parent))
+        {
+            return path.StartsWith(parent, PathComparison);
+        }
+
         return string.Equals(parent, path, PathComparison)
             || path.StartsWith(parent + Path.DirectorySeparatorChar, PathComparison)
             || path.StartsWith(parent + Path.AltDirectorySeparatorChar, PathComparison);

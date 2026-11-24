@@ -45,12 +45,14 @@ public sealed class ExecutionResourceViewTests : IDisposable
         SaveConfig(oldVolume);
         var awaitingApproval = new TaskCompletionSource<ApprovalRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
         var approved = NewSignal();
+        ExecutionResourceDomain? firstDomain = null;
         var runtime = CreateRuntime(async (input, context) =>
         {
             Assert.Contains("/volumes/data", context.EnvironmentDescription);
             Assert.DoesNotContain(_root.FullName, context.EnvironmentDescription);
             if (input == "first")
             {
+                firstDomain = context.ResourceDomain;
                 var path = PathArgs("/volumes/data/./note.txt");
                 path["content"] = "first";
                 var declared = Assert.Single(context.ResolveToolResourceAccesses("file.write", path));
@@ -66,6 +68,14 @@ public sealed class ExecutionResourceViewTests : IDisposable
                 Assert.Contains("/volumes/data/note.txt",
                     await context.InvokeToolAsync("file.list", PathArgs("/volumes/data")));
                 Assert.Contains("/volumes/data/", await context.InvokeToolAsync("file.list", PathArgs("/volumes")));
+            }
+            else
+            {
+                Assert.NotSame(firstDomain, context.ResourceDomain);
+                Assert.Equal(new VirtualMount("workspace", "/workspace", newWorkspace, false),
+                    Assert.Single(context.ResourceDomain.Mounts, mount => mount.VirtualPath == "/workspace"));
+                Assert.Equal(new VirtualMount("data", "/volumes/data", newVolume, true),
+                    Assert.Single(context.ResourceDomain.Mounts, mount => mount.VirtualPath == "/volumes/data"));
             }
 
             var workspace = await context.InvokeToolAsync("file.read", PathArgs("marker.txt"));
@@ -87,8 +97,15 @@ public sealed class ExecutionResourceViewTests : IDisposable
             Assert.Equal("vafs:/volumes/data/note.txt", Assert.Single(request.ResourceAccesses).Resource.Value);
             SaveConfig(newVolume);
             SetEnvironment("AUXIM_WORKSPACE", newWorkspace);
+            SetEnvironment("AUXIM_VAFS_MOUNTS", $"data={newVolume}:ro");
             var second = await runtime.RunInContextAsync("second").WaitAsync(WaitLimit);
             Assert.Equal("new workspace, new volume", second.FinalResponse);
+            Assert.NotNull(firstDomain);
+            Assert.Equal(new VirtualMount("workspace", "/workspace", oldWorkspace, false),
+                Assert.Single(firstDomain.Mounts, mount => mount.VirtualPath == "/workspace"));
+            Assert.Equal(new VirtualMount("data", "/volumes/data", oldVolume, false),
+                Assert.Single(firstDomain.Mounts, mount => mount.VirtualPath == "/volumes/data"));
+            Assert.Throws<NotSupportedException>(() => ((IList<VirtualMount>)firstDomain.Mounts).Clear());
         }
         finally
         {
@@ -109,10 +126,61 @@ public sealed class ExecutionResourceViewTests : IDisposable
         }, configPath);
     }
 
+    [Theory]
+    [InlineData("file.read")]
+    [InlineData("file.write")]
+    [InlineData("file.patch")]
+    [InlineData("file.list")]
+    [InlineData("file.search")]
+    public async Task BuiltInFileToolCanRebindToAnotherResourceView(string name)
+    {
+        var workspace = MakeDirectory("workspace");
+        var volume = MakeDirectory("volume");
+        var options = new SandboxConfig { Workspace = workspace };
+        options.Mounts.Add(new SandboxMountConfig { Name = "rebound", HostPath = volume });
+        using var resources = new ExecutionResourceView(options, _home, followDirectoryLinksInListings: false);
+        var runtime = CreateRuntime((_, context) =>
+        {
+            var entry = Assert.Single(context.ToolRebinders);
+            Assert.Equal(name, entry.Key);
+            Assert.NotNull(entry.Value);
+            var rebound = entry.Value(resources.FileSystem);
+            var listed = Assert.Single(context.ListTools());
+            Assert.Equal(listed.Name, rebound.Name);
+            Assert.Same(listed.ParametersSchema, rebound.ParametersSchema);
+            var arguments = PathArgs("/volumes/rebound/note.txt");
+            Assert.Throws<VirtualPathException>(() => context.ResolveToolResourceAccesses(name, arguments));
+            var accesses = rebound.ResolveResourceAccesses(arguments);
+            Assert.Equal(name == "file.patch" ? 2 : 1, accesses.Count);
+            Assert.All(accesses, access => Assert.Equal("vafs:/volumes/rebound/note.txt", access.Resource.Value));
+            return Task.FromResult(new AgentResult("done", []));
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } });
+
+        await runtime.RunInContextAsync("run", new AuximRuntimeOptions { AllowedToolNames = [name] });
+    }
+
+    [Fact]
+    public async Task PublicRegistrationCannotCarryTrustedRebindingEligibility()
+    {
+        var registry = new ToolRegistry();
+        FileTools.Register(registry);
+        var original = registry.Get("file.read");
+        registry.Register(original with { ResourceViewBinder = _ => original });
+        var runtime = CreateRuntime((_, context) =>
+        {
+            Assert.Equal("file.read", Assert.Single(context.ListTools()).Name);
+            Assert.Null(context.ToolRebinders["FILE.READ"]);
+            return Task.FromResult(new AgentResult("done", []));
+        }, registryFactory: () => registry);
+
+        await runtime.RunInContextAsync("run", new AuximRuntimeOptions { AllowedToolNames = ["file.read"] });
+    }
+
     [Fact]
     public async Task PrivateTmpIsIsolatedAndCleanedAfterSuccessFailureAndCancellationDrain()
     {
         var registry = BuiltInTools.CreateDefaultRegistry();
+        var domains = new ConcurrentDictionary<string, ExecutionResourceDomain>();
         var entered = new Dictionary<string, TaskCompletionSource<string>>
         {
             ["success"] = new(TaskCreationOptions.RunContinuationsAsynchronously),
@@ -144,6 +212,8 @@ public sealed class ExecutionResourceViewTests : IDisposable
         var runtime = CreateRuntime(async (input, context) =>
         {
             var tmp = await context.InvokeToolAsync("test.tmp", PathArgs("/tmp"));
+            domains[input] = context.ResourceDomain;
+            Assert.DoesNotContain(context.ResourceDomain.Mounts, mount => mount.VirtualPath == "/tmp" || mount.HostPath == tmp);
             var args = PathArgs("/tmp/shared.txt");
             args["content"] = input;
             await context.InvokeToolAsync("file.write", args);
@@ -172,6 +242,8 @@ public sealed class ExecutionResourceViewTests : IDisposable
         try
         {
             Assert.NotEqual(tmpPaths[0], tmpPaths[1]);
+            Assert.NotSame(domains["success"], domains["cancel"]);
+            Assert.Equal<VirtualMount>(domains["success"].Mounts, domains["cancel"].Mounts);
             Assert.DoesNotContain(Environment.GetEnvironmentVariable("AUXIM_TMP")!, tmpPaths);
             Assert.Equal("success", await File.ReadAllTextAsync(Path.Combine(tmpPaths[0], "shared.txt")));
             Assert.Equal("cancel", await File.ReadAllTextAsync(Path.Combine(tmpPaths[1], "shared.txt")));
@@ -674,6 +746,34 @@ public sealed class ExecutionResourceViewTests : IDisposable
     }
 
     [Fact]
+    public async Task CancellationDuringToolBindingCleansUpWithoutPublishingRunEvents()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var events = new ConcurrentQueue<RuntimeEvent>();
+        var registry = new ToolRegistry();
+        string? temporaryPath = null;
+        var definition = new ToolDefinition("test.bind", "test", "", (_, _) => Task.FromResult("done"));
+        registry.Register(definition with
+        {
+            ResourceViewBinder = view =>
+            {
+                temporaryPath = view.ResolveToHostPath("/tmp");
+                Assert.True(Directory.Exists(temporaryPath));
+                cancellation.Cancel();
+                return definition;
+            },
+        });
+        var runtime = CreateRuntime((_, _) => throw new InvalidOperationException("Runner must not start."),
+            registryFactory: () => registry);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            runtime.RunInContextAsync("cancel", CaptureEvents(events), cancellation.Token).WaitAsync(WaitLimit));
+        Assert.NotNull(temporaryPath);
+        Assert.False(Directory.Exists(temporaryPath));
+        Assert.Empty(events);
+    }
+
+    [Fact]
     public async Task SetupFailureDeletesOwnedTmpAndStrictVafsRejectsUnusableTmp()
     {
         var file = Path.Combine(_root.FullName, "not-a-directory");
@@ -741,11 +841,403 @@ public sealed class ExecutionResourceViewTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task ChildUsesCapturedMountsAndCatalogAndInheritsApprovalWithoutRemembering()
+    {
+        var original = MakeDirectory("original");
+        var replacement = MakeDirectory("replacement");
+        var config = new AuximConfig { Sandbox = new SandboxConfig { Workspace = original } };
+        var registry = CreateRegistryWithTmpProbe();
+        FileTools.Register(registry);
+        var events = new ConcurrentQueue<RuntimeEvent>();
+        var approvalsPath = Path.Combine(_home, "approvals.json");
+        var approvalStore = new ToolApprovalService(_home);
+        await approvalStore.ReviewAsync(AuximRunId.New(), "file.write", PathArgs("/workspace/note.txt"),
+            [new(ResourceAction.Write, ResourceUri.Vafs("/workspace/note.txt"), RequiresApproval: true)],
+            new Approval((_, _) => Task.FromResult(ApprovalResponse.Allow(remember: true))),
+            CaptureEvents(events).EventSink!, CancellationToken.None);
+        events.Clear();
+        var remembered = await File.ReadAllTextAsync(approvalsPath);
+        var approvalCount = 0;
+        string? parentTmp = null;
+        ExecutionResourceDomain? domain = null;
+        AuximExecutionId parentId = default;
+        AuximExecutionId childId = default;
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            if (input == "parent")
+            {
+                parentId = context.ExecutionId;
+                domain = context.ResourceDomain;
+                parentTmp = await context.InvokeToolAsync("test.tmp", PathArgs("/tmp"));
+                config = new AuximConfig { Sandbox = new SandboxConfig { Workspace = replacement } };
+                SetEnvironment("AUXIM_WORKSPACE", replacement);
+                SetEnvironment("AUXIM_VAFS_MOUNTS", "invalid");
+                registry.Register(new ToolDefinition("file.read", "test", "", (_, _) => throw new InvalidOperationException()));
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() => runtime.RunChildInContextAsync(context, "denied",
+                    new AuximRuntimeOptions { AllowedToolNames = ["test.tmp"] }));
+                var child = await runtime.RunChildInContextAsync(context, "child");
+                Assert.True(Directory.Exists(parentTmp));
+                return child;
+            }
+
+            Assert.Equal("child", input);
+            childId = context.ExecutionId;
+            Assert.Same(domain, context.ResourceDomain);
+            Assert.Equal(original, context.Configuration.Sandbox.Workspace);
+            Assert.Equal(["file.read", "file.write"], context.ListTools().Select(tool => tool.Name));
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => context.InvokeToolAsync("file.read", PathArgs("/tmp/note.txt")));
+            var arguments = PathArgs("/workspace/note.txt");
+            arguments["content"] = "from child";
+            await context.InvokeToolAsync("file.write", arguments);
+            return new AgentResult(await context.InvokeToolAsync("file.read", arguments), []);
+        }, () => config, () => registry, supportsConcurrentContexts: true);
+
+        var result = await runtime.RunInContextAsync("parent", new AuximRuntimeOptions
+        {
+            AllowedToolNames = ["file.read", "file.write", "test.tmp"],
+            ApprovalHandler = new Approval((_, _) =>
+            {
+                approvalCount++;
+                return Task.FromResult(ApprovalResponse.Allow(remember: true));
+            }),
+            EventSink = CaptureEvents(events).EventSink,
+        });
+
+        Assert.Equal("from child", result.FinalResponse);
+        Assert.Equal("from child", await File.ReadAllTextAsync(Path.Combine(original, "note.txt")));
+        Assert.False(File.Exists(Path.Combine(replacement, "note.txt")));
+        Assert.NotNull(parentTmp);
+        Assert.False(Directory.Exists(parentTmp));
+        Assert.Equal(1, approvalCount);
+        Assert.Equal(remembered, await File.ReadAllTextAsync(approvalsPath));
+        Assert.NotEqual(parentId, childId);
+        Assert.Equal(new AuximExecutionId?[] { childId, parentId },
+            events.OfType<RuntimeRunCompletedEvent>().Select(value => value.ExecutionId));
+        Assert.All(events.Where(value => value.ExecutionId == childId), value => Assert.Equal(parentId, value.ParentExecutionId));
+        Assert.All(events.Where(value => value.ExecutionId == parentId), value => Assert.Null(value.ParentExecutionId));
+        Assert.Contains($"parentExecution={parentId}", ReadLog());
+        Assert.Contains($"Child execution denied for execution {parentId}", ReadLog());
+        var decision = Assert.Single(events.OfType<RuntimeApprovalResolvedEvent>());
+        Assert.Equal(childId, decision.ExecutionId);
+        Assert.False(decision.Remembered);
+    }
+
+    [Fact]
+    public async Task ChildRequestsCannotExceedTheParentPermissions()
+    {
+        var workspace = MakeDirectory("workspace");
+        Directory.CreateDirectory(Path.Combine(workspace, "docs"));
+        await File.WriteAllTextAsync(Path.Combine(workspace, "docs", "note.txt"), "allowed");
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            if (input == "empty")
+            {
+                Assert.Empty(context.ListTools());
+                Assert.Empty(context.ResourcePermissions!);
+                return new AgentResult("empty", []);
+            }
+
+            if (input == "child")
+            {
+                Assert.Equal("file.read", Assert.Single(context.ListTools()).Name);
+                return new AgentResult(await context.InvokeToolAsync("file.read", PathArgs("/workspace/docs/note.txt")), []);
+            }
+
+            if (input == "inherited")
+            {
+                Assert.DoesNotContain(context.ResourcePermissions!, grant => grant.VirtualPath == "/tmp");
+                Assert.NotEmpty(context.ResolveToolResourceAccesses("file.list", PathArgs("/")));
+                Assert.Throws<UnauthorizedAccessException>(() => context.ResolveToolResourceAccesses("file.list", PathArgs("/volumes")));
+                return new AgentResult("inherited", []);
+            }
+
+            Assert.Equal("parent", input);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => runtime.RunChildInContextAsync(context, "denied",
+                new AuximRuntimeOptions { AllowedToolNames = ["file.write"] }));
+            foreach (var permission in new VafsResourcePermission[]
+            {
+                new(ResourceAction.Write, "/workspace/docs/note.txt"),
+                new(ResourceAction.Read, "/workspace/docs-other/note.txt"),
+                new(ResourceAction.Read, "/workspace/exact", IncludeDescendants: true),
+                new(ResourceAction.Read, "/tmp", IncludeDescendants: true),
+                new(ResourceAction.Read, "/volumes"),
+            })
+            {
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() => runtime.RunChildInContextAsync(context, "denied",
+                    new AuximRuntimeOptions { ResourcePermissions = [permission] }));
+            }
+
+            await Assert.ThrowsAsync<ArgumentException>(() => runtime.RunChildInContextAsync(context, "denied",
+                new AuximRuntimeOptions { ResourcePermissions = [new(ResourceAction.Read, "/", IncludeDescendants: true)] }));
+            Assert.Equal("inherited", (await runtime.RunChildInContextAsync(context, "inherited")).FinalResponse);
+            Assert.Equal("empty", (await runtime.RunChildInContextAsync(context, "empty", new AuximRuntimeOptions
+            {
+                AllowedToolNames = [],
+                ResourcePermissions = [],
+            })).FinalResponse);
+            return await runtime.RunChildInContextAsync(context, "child", new AuximRuntimeOptions
+            {
+                AllowedToolNames = ["FILE.READ"],
+                ResourcePermissions = [new(ResourceAction.Read, "/workspace/docs/note.txt"), new(ResourceAction.Read, "/")],
+            });
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } }, supportsConcurrentContexts: true);
+
+        var result = await runtime.RunInContextAsync("parent", new AuximRuntimeOptions
+        {
+            AllowedToolNames = ["file.read", "file.list"],
+            ResourcePermissions =
+            [
+                new(ResourceAction.Read, "/"),
+                new(ResourceAction.Read, "/workspace/docs", IncludeDescendants: true),
+                new(ResourceAction.Read, "/workspace/exact"),
+                new(ResourceAction.Read, "/tmp", IncludeDescendants: true),
+            ],
+        });
+        Assert.Equal("allowed", result.FinalResponse);
+    }
+
+    [Fact]
+    public async Task ChildRequiresTheParentRuntimeAndAnOptedInRunner()
+    {
+        var workspace = MakeDirectory("workspace");
+        var other = CreateRuntime((_, _) => throw new InvalidOperationException("Foreign runner must not run."),
+            supportsConcurrentContexts: true);
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            Assert.Equal("parent", input);
+            await Assert.ThrowsAsync<ArgumentException>("parent", () => other.RunChildInContextAsync(context, "foreign"));
+            await Assert.ThrowsAsync<NotSupportedException>(() => runtime.RunChildInContextAsync(context, "unsupported"));
+            return new AgentResult("done", []);
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } });
+
+        Assert.Equal("done", (await runtime.RunInContextAsync("parent")).FinalResponse);
+    }
+
+    [Theory]
+    [InlineData("success")]
+    [InlineData("failure")]
+    [InlineData("cancellation")]
+    public async Task ParentCloseCancelsAndDrainsAnAdmittedChild(string outcome)
+    {
+        var workspace = MakeDirectory("workspace");
+        var childStarted = NewSignal();
+        var childCanceled = NewSignal();
+        var releaseChild = NewSignal();
+        var events = new ConcurrentQueue<RuntimeEvent>();
+        var originalFailure = new InvalidOperationException("parent runner failed");
+        using var cancellation = new CancellationTokenSource();
+        AuximExecutionContext? parent = null;
+        AuximExecutionContext? child = null;
+        Task<AgentResult>? childRun = null;
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            if (input == "child")
+            {
+                child = context;
+                using var registration = context.CancellationToken.Register(() => childCanceled.TrySetResult());
+                childStarted.SetResult();
+                await releaseChild.Task.WaitAsync(WaitLimit);
+                context.CancellationToken.ThrowIfCancellationRequested();
+                throw new InvalidOperationException("The child should have been canceled.");
+            }
+
+            Assert.Equal("parent", input);
+            parent = context;
+            childRun = runtime.RunChildInContextAsync(context, "child");
+            await childStarted.Task.WaitAsync(WaitLimit);
+            if (outcome == "failure")
+            {
+                cancellation.Cancel();
+                throw originalFailure;
+            }
+
+            if (outcome == "cancellation")
+            {
+                cancellation.Cancel();
+            }
+
+            return new AgentResult("done", []);
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } }, supportsConcurrentContexts: true);
+
+        var run = runtime.RunInContextAsync("parent", CaptureEvents(events), cancellation.Token);
+        try
+        {
+            await childCanceled.Task.WaitAsync(WaitLimit);
+            Assert.NotNull(parent);
+            Assert.NotNull(childRun);
+            Assert.False(childRun.IsCompleted);
+            Assert.False(run.IsCompleted);
+            Assert.Empty(events.OfType<RuntimeRunFailedEvent>());
+            if (outcome == "success")
+            {
+                await Assert.ThrowsAsync<ObjectDisposedException>(() => runtime.RunChildInContextAsync(parent, "late"));
+            }
+        }
+        finally
+        {
+            releaseChild.TrySetResult();
+        }
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => childRun!.WaitAsync(WaitLimit));
+        if (outcome == "cancellation")
+        {
+            var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(WaitLimit));
+            Assert.Equal(cancellation.Token, exception.CancellationToken);
+        }
+        else
+        {
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(WaitLimit));
+            if (outcome == "failure")
+            {
+                Assert.Same(originalFailure, exception);
+            }
+            else
+            {
+                Assert.Contains("1 outstanding context operation", exception.Message);
+            }
+        }
+
+        Assert.NotNull(child);
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => runtime.RunChildInContextAsync(parent!, "late"));
+        Assert.Equal(new AuximExecutionId?[] { child.ExecutionId, parent!.ExecutionId },
+            events.OfType<RuntimeRunFailedEvent>().Select(value => value.ExecutionId));
+        var failed = events.OfType<RuntimeRunFailedEvent>().ToArray();
+        Assert.True(failed[0].IsCanceled);
+        Assert.Equal(parent!.ExecutionId, failed[0].ParentExecutionId);
+        Assert.Equal(outcome == "cancellation", failed[1].IsCanceled);
+        Assert.Null(failed[1].ParentExecutionId);
+        var restored = JsonSerializer.Deserialize<RuntimeRunFailedEvent>(JsonSerializer.Serialize(failed[0]));
+        Assert.NotNull(restored);
+        Assert.Equal(failed[0].ParentExecutionId, restored.ParentExecutionId);
+        Assert.True(restored.IsCanceled);
+        var legacyFailure = new RuntimeRunFailedEvent("legacy", failed[0].OccurredAt, failed[0].RunId, "session", "error");
+        using var legacyJson = JsonDocument.Parse(JsonSerializer.Serialize(legacyFailure));
+        Assert.False(legacyJson.RootElement.TryGetProperty(nameof(RuntimeEvent.ParentExecutionId), out _));
+        Assert.False(legacyJson.RootElement.TryGetProperty(nameof(RuntimeRunFailedEvent.IsCanceled), out _));
+        Assert.Empty(events.OfType<RuntimeRunCompletedEvent>());
+    }
+
+    [Fact]
+    public async Task ParentClosureWaitsForAdmittedChildSetupWithoutStartingItsRunner()
+    {
+        var workspace = MakeDirectory("workspace");
+        var setupEntered = NewSignal();
+        var releaseSetup = NewSignal();
+        var closing = NewSignal();
+        Task<AgentResult>? childRun = null;
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            Assert.Equal("parent", input);
+            context.CancellationToken.Register(() => closing.TrySetResult());
+            childRun = Task.Run(() => runtime.RunChildInContextAsync(context, "child", new AuximRuntimeOptions
+            {
+                AllowedToolNames = new BlockingToolNames(() =>
+                {
+                    setupEntered.SetResult();
+                    releaseSetup.Task.WaitAsync(WaitLimit).GetAwaiter().GetResult();
+                }),
+            }));
+            await setupEntered.Task.WaitAsync(WaitLimit);
+            return new AgentResult("done", []);
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } }, supportsConcurrentContexts: true);
+
+        var events = new ConcurrentQueue<RuntimeEvent>();
+        var run = runtime.RunInContextAsync("parent", CaptureEvents(events));
+        try
+        {
+            await closing.Task.WaitAsync(WaitLimit);
+            Assert.False(run.IsCompleted);
+            Assert.Empty(events.OfType<RuntimeRunFailedEvent>());
+        }
+        finally
+        {
+            releaseSetup.TrySetResult();
+        }
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => childRun!.WaitAsync(WaitLimit));
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(WaitLimit));
+        Assert.Contains("1 outstanding context operation", exception.Message);
+        Assert.Single(events.OfType<RuntimeRunStartedEvent>());
+    }
+
+    [Fact]
+    public void DelegatedResourceViewOwnsItsTemporaryDirectory()
+    {
+        using var parent = new ExecutionResourceView(
+            new SandboxConfig { Workspace = MakeDirectory("workspace") }, _home, followDirectoryLinksInListings: false);
+        var parentTmp = parent.FileSystem.ResolveToHostPath("/tmp");
+        string childTmp;
+        using (var child = new ExecutionResourceView(parent.Domain, _home))
+        {
+            childTmp = child.FileSystem.ResolveToHostPath("/tmp");
+            Assert.Same(parent.Domain, child.Domain);
+            Assert.NotEqual(parentTmp, childTmp);
+            Assert.True(Directory.Exists(childTmp));
+        }
+
+        Assert.False(Directory.Exists(childTmp));
+        Assert.True(Directory.Exists(parentTmp));
+    }
+
+    [Fact]
+    public async Task CancelingAChildDoesNotCancelItsParentOrSibling()
+    {
+        var workspace = MakeDirectory("workspace");
+        var canceledChildReady = NewSignal();
+        var siblingReady = NewSignal();
+        var releaseSibling = NewSignal();
+        using var cancellation = new CancellationTokenSource();
+        AuximRuntimeService runtime = null!;
+        runtime = CreateRuntime(async (input, context) =>
+        {
+            if (input == "canceled")
+            {
+                canceledChildReady.SetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, context.CancellationToken).WaitAsync(WaitLimit);
+                throw new InvalidOperationException("The child should have been canceled.");
+            }
+
+            if (input == "sibling")
+            {
+                siblingReady.SetResult();
+                await releaseSibling.Task.WaitAsync(WaitLimit, context.CancellationToken);
+                return new AgentResult("sibling", []);
+            }
+
+            Assert.Equal("parent", input);
+            var canceled = runtime.RunChildInContextAsync(context, "canceled", cancellationToken: cancellation.Token);
+            var sibling = runtime.RunChildInContextAsync(context, "sibling");
+            try
+            {
+                await Task.WhenAll(canceledChildReady.Task, siblingReady.Task).WaitAsync(WaitLimit);
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled.WaitAsync(WaitLimit));
+                Assert.False(context.CancellationToken.IsCancellationRequested);
+                Assert.False(sibling.IsCompleted);
+            }
+            finally
+            {
+                releaseSibling.TrySetResult();
+            }
+
+            return await sibling;
+        }, () => new AuximConfig { Sandbox = new SandboxConfig { Workspace = workspace } }, supportsConcurrentContexts: true);
+
+        Assert.Equal("sibling", (await runtime.RunInContextAsync("parent")).FinalResponse);
+    }
+
     private AuximRuntimeService CreateRuntime(
         Func<string, AuximExecutionContext, Task<AgentResult>> run,
         Func<AuximConfig>? configLoader = null,
-        Func<ToolRegistry>? registryFactory = null) =>
-        new(new Runner(run), new RuntimeToolService(registryFactory ?? BuiltInTools.CreateDefaultRegistry),
+        Func<ToolRegistry>? registryFactory = null,
+        bool supportsConcurrentContexts = false) =>
+        new(new Runner(run, supportsConcurrentContexts), new RuntimeToolService(registryFactory ?? BuiltInTools.CreateDefaultRegistry),
             configLoader: configLoader, homeDirectory: () => _home,
             environmentDescription: () => throw new InvalidOperationException("Context must describe its bound VAFS."));
 
@@ -778,8 +1270,24 @@ public sealed class ExecutionResourceViewTests : IDisposable
         public Task<ApprovalResponse> RequestAsync(ApprovalRequest request, CancellationToken token) => review(request, token);
     }
 
-    private sealed class Runner(Func<string, AuximExecutionContext, Task<AgentResult>> run) : IAgentRunner
+    private sealed class BlockingToolNames(Action wait) : IReadOnlyCollection<string>
     {
+        public int Count => 1;
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            wait();
+            yield return "file.read";
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    private sealed class Runner(
+        Func<string, AuximExecutionContext, Task<AgentResult>> run, bool supportsConcurrentContexts) : IAgentRunner
+    {
+        public bool SupportsConcurrentContextExecutions => supportsConcurrentContexts;
+
         public Task<AgentResult> RunAsync(AgentRunRequest request, CancellationToken token) => throw new NotSupportedException();
         public Task<AgentResult> RunInContextAsync(string input, AuximExecutionContext context) => run(input, context);
     }

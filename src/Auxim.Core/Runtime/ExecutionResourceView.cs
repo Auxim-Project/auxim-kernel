@@ -12,6 +12,24 @@ internal sealed class ExecutionResourceView : IDisposable
     public ExecutionResourceView(
         SandboxConfig sandbox, string homeDirectory, bool followDirectoryLinksInListings,
         Func<string, Stream>? createOwnershipMarker = null)
+        : this(tmpPath => VirtualAgentFileSystemOptions.CaptureMountsFromEnvironment(
+                sandbox.Workspace, sandbox.Mounts.Select(mount => new VirtualMount(
+                    mount.Name, $"/volumes/{mount.Name}", mount.HostPath, mount.ReadOnly)), tmpPath),
+            homeDirectory, followDirectoryLinksInListings, createOwnershipMarker)
+    {
+    }
+
+    internal ExecutionResourceView(ExecutionResourceDomain domain, string homeDirectory)
+        : this(domain.CreateViewOptions, homeDirectory, followDirectoryLinksInListings: false, domain: domain)
+    {
+    }
+
+    private ExecutionResourceView(
+        Func<string, VirtualAgentFileSystemOptions> captureOptions,
+        string homeDirectory,
+        bool followDirectoryLinksInListings,
+        Func<string, Stream>? createOwnershipMarker = null,
+        ExecutionResourceDomain? domain = null)
     {
         _temporaryDirectory = Directory.CreateTempSubdirectory("auxim-execution-");
         var markerCreated = false;
@@ -25,10 +43,8 @@ internal sealed class ExecutionResourceView : IDisposable
                 markerCreated = true;
             }
 
-            var mounts = sandbox.Mounts.Select(mount => new VirtualMount(
-                mount.Name, $"/volumes/{mount.Name}", mount.HostPath, mount.ReadOnly));
-            FileSystem = new VirtualAgentFileSystem(VirtualAgentFileSystemOptions.CaptureMountsFromEnvironment(
-                sandbox.Workspace, mounts, _temporaryDirectory.FullName), followDirectoryLinksInListings);
+            FileSystem = new VirtualAgentFileSystem(captureOptions(_temporaryDirectory.FullName), followDirectoryLinksInListings);
+            Domain = domain ?? new ExecutionResourceDomain(FileSystem);
         }
         catch
         {
@@ -48,6 +64,8 @@ internal sealed class ExecutionResourceView : IDisposable
     }
 
     public VirtualAgentFileSystem FileSystem { get; }
+
+    internal ExecutionResourceDomain Domain { get; }
 
     public void Dispose()
     {
@@ -135,4 +153,22 @@ internal sealed class ExecutionResourceView : IDisposable
             AuximLog.Warning($"Setup cleanup failed: {exception.Message}", homeDirectory);
         }
     }
+}
+
+internal sealed class ExecutionResourceDomain
+{
+    internal ExecutionResourceDomain(VirtualAgentFileSystem fileSystem)
+    {
+        Mounts = Array.AsReadOnly(fileSystem.ListMounts().Where(mount => mount.VirtualPath != "/tmp").ToArray());
+    }
+
+    internal IReadOnlyList<VirtualMount> Mounts { get; }
+
+    internal VirtualAgentFileSystemOptions CreateViewOptions(string tmpPath) => new()
+    {
+        WorkspaceHostPath = Mounts.Single(mount => mount.VirtualPath == "/workspace").HostPath,
+        Mounts = Mounts.Where(mount => mount.VirtualPath != "/workspace").ToArray(),
+        TmpHostPath = tmpPath,
+        AllowSharedTmpFallback = false,
+    };
 }

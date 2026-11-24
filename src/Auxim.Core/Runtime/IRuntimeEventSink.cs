@@ -85,7 +85,18 @@ internal sealed class RuntimeLogEventSink : IRuntimeEventSink
             message += $" execution={executionId}";
         }
 
+        if (runtimeEvent.ParentExecutionId is { } parentExecutionId)
+        {
+            message += $" parentExecution={parentExecutionId}";
+        }
+
+        if (runtimeEvent is RuntimeRunFailedEvent { IsCanceled: true })
+        {
+            message += " outcome=canceled";
+        }
+
         if (runtimeEvent is RuntimeRunFailedEvent
+            || runtimeEvent is RuntimeToolCompletedEvent { ExecutionId: not null, Outcome: "denied" }
             || runtimeEvent is RuntimeApprovalResolvedEvent { Approved: false })
         {
             AuximLog.Warning(message, _homeDirectory);

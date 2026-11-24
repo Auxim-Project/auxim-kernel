@@ -171,8 +171,20 @@ public sealed class ResourcePermissionTests : IDisposable
             await AssertDenied(context, "file.write", Args("missing/deep.txt", ("content", "denied")));
             Assert.Throws<InvalidOperationException>(() =>
                 context.ResolveToolResourceAccesses("file.search", Args("original.txt")));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                context.InvokeToolAsync("file.search", Args("original.txt")));
             Assert.Empty(handler.Requests);
             Assert.Empty(events.OfType<RuntimeToolStartedEvent>());
+            var denials = events.OfType<RuntimeToolCompletedEvent>().ToArray();
+            Assert.Equal(["file.read", "file.write", "file.patch", "file.write", "file.search"],
+                denials.Select(value => value.ToolName));
+            Assert.All(denials, value =>
+            {
+                Assert.Equal("denied", value.Outcome);
+                Assert.Equal(context.ExecutionId, value.ExecutionId);
+                Assert.Equal(0, value.OutputLength);
+            });
+            Assert.Equal(denials.Length, denials.Select(value => value.ToolCallId).Distinct().Count());
 
             var write = Args("original.txt", ("content", "updated"));
             await context.InvokeToolAsync("file.write", write);
@@ -215,23 +227,40 @@ public sealed class ResourcePermissionTests : IDisposable
         var volume = _root.CreateSubdirectory("readonly").FullName;
         var file = Path.Combine(volume, "note.txt");
         File.WriteAllText(file, "original");
+        var handler = new RecordingApprovalHandler();
+        var events = new List<RuntimeEvent>();
         var runtime = CreateRuntime(async (_, context) =>
         {
             var path = Args("/volumes/data/note.txt", ("content", "denied"));
             Assert.Equal("original", await context.InvokeToolAsync("file.read", path));
             Assert.Throws<VirtualPathException>(() => context.ResolveToolResourceAccesses("file.write", path));
             await Assert.ThrowsAsync<VirtualPathException>(() => context.InvokeToolAsync("file.write", path));
+            await Assert.ThrowsAsync<VirtualPathException>(() => context.InvokeToolAsync("file.patch",
+                Args("/volumes/data/note.txt", ("oldText", "original"), ("newText", "denied"))));
+            await Assert.ThrowsAsync<VirtualPathException>(() => context.InvokeToolAsync("file.write",
+                Args("/volumes/missing/note.txt", ("content", "denied"))));
             return new AgentResult("done", []);
         }, mounts: [new SandboxMountConfig { Name = "data", HostPath = volume, ReadOnly = true }]);
 
         await runtime.RunInContextAsync("run", new AuximRuntimeOptions
         {
+            ApprovalHandler = handler,
+            EventSink = new DelegateRuntimeEventSink((value, _) =>
+            {
+                events.Add(value);
+                return ValueTask.CompletedTask;
+            }),
             ResourcePermissions =
             [
                 new(ResourceAction.Read, "/volumes/data/note.txt"),
                 new(ResourceAction.Write, "/volumes/data/note.txt"),
             ],
         });
+        Assert.Empty(handler.Requests);
+        Assert.Empty(events.OfType<RuntimeApprovalRequestedEvent>());
+        Assert.Equal("file.read", Assert.Single(events.OfType<RuntimeToolStartedEvent>()).ToolName);
+        Assert.Equal(new[] { ("file.read", "succeeded"), ("file.write", "denied"), ("file.patch", "denied"), ("file.write", "failed") },
+            events.OfType<RuntimeToolCompletedEvent>().Select(value => (value.ToolName, value.Outcome)));
         Assert.Equal("original", File.ReadAllText(file));
     }
 
@@ -481,6 +510,10 @@ public sealed class ResourcePermissionTests : IDisposable
         {
             (input == "first" ? firstEntered : secondEntered).SetResult();
             await mayRead.Task.WaitAsync(TestTimeout, context.CancellationToken);
+            Assert.NotNull(context.ResourcePermissions);
+            Assert.Equal(new VafsResourcePermission(ResourceAction.Read, $"/workspace/{input}.txt"),
+                Assert.Single(context.ResourcePermissions));
+            Assert.Throws<NotSupportedException>(() => ((IList<VafsResourcePermission>)context.ResourcePermissions).Clear());
             var denied = input == "first" ? "second.txt" : "first.txt";
             await AssertDenied(context, "file.read", Args(denied));
             return new AgentResult(await context.InvokeToolAsync("file.read", Args($"{input}.txt")), []);

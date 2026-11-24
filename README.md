@@ -55,6 +55,8 @@ to resolvers and handlers as immutable JSON, so an approval applies to the
 arguments captured for that invocation. Exceptions from nonterminal event
 callbacks propagate through the operation. Terminal events are delivered on a
 best-effort basis and delivery failures are logged.
+If cancellation prevents startup event publication from completing, the Kernel
+cleans up and returns cancellation without emitting a terminal run event.
 
 Runners must finish their accepted context operations before returning. Once
 the Kernel registers the returned runner task, admission and operation exit
@@ -131,6 +133,39 @@ listings do not classify links by their targets. These checks apply to trusted
 tool declarations and the bound view. They do not establish file identity
 across hard links or OS mount aliases, nor do they eliminate races between
 validation and I/O.
+
+`AuximRuntimeService.RunChildInContextAsync` starts a child from an active
+context owned by that runtime. The runner must explicitly opt in through
+`IAgentRunner.SupportsConcurrentContextExecutions` and support a parent
+awaiting a child on the same instance. The child inherits the parent's
+approval handler and event sink and has its own execution ID and run ID.
+Remembered approvals remain disabled.
+
+Child tool and resource requests must fit within the parent's effective
+permissions. Null lists inherit delegable permissions and empty lists deny
+all in the corresponding category. An unrestricted parent's delegable
+resources are its non-temporary mounts, subject to read-only flags and
+restricted path checks, plus exact reads of synthetic metadata roots.
+Custom binders are excluded from inherited child catalogs. Explicit
+requests for unavailable or non-rebindable tools fail. The child uses the
+parent's captured workspace and volume mappings and owns a fresh /tmp.
+The child receives no temporary resource grants.
+
+The parent tracks the child through its terminal event and cleanup.
+Parent cancellation propagates to admitted children. Child cancellation
+affects only its own execution and descendants. A parent that returns
+with live children follows the same cancellation and drain rules as
+other outstanding context operations.
+
+Child events include `ParentExecutionId`. Each execution still has its own
+`ExecutionId` and `RunId`. Cancellation uses `run.failed` with
+`IsCanceled` set when the run ends in response to its cancellation signal.
+Group concurrent events by execution and tool call IDs. A context tool
+invocation rejected by the catalog or resource policy reports
+`tool.completed` with outcome `denied`. A preflight rejection can arrive
+without `tool.started` or an approval event. Resource previews return
+errors to their caller. A child request rejected by the permission checks
+before a child context is created throws and is logged against the parent.
 
 File search validates explicit paths through VAFS and skips symbolic links and
 other reparse points encountered during recursive traversal. It also skips
