@@ -5,6 +5,7 @@ using Xunit;
 
 namespace Auxim.Core.Tests;
 
+[Collection("VAFS environment")]
 public sealed class VirtualAgentFileSystemTests : IDisposable
 {
     private readonly string _workspace;

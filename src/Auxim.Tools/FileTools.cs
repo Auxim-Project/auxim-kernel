@@ -8,28 +8,28 @@ public static class FileTools
 {
     public static void Register(ToolRegistry registry)
     {
-        registry.Register(new ToolDefinition(
+        RegisterFileTool(registry, view => new ToolDefinition(
             "file.read",
             "files",
             "Reads a UTF-8 text file under /workspace, /tmp, or mounted /volumes paths.",
             (args, _) =>
             {
-                var path = Vafs().ResolveToHostPath(Required(args, "path"));
+                var path = (view ?? Vafs()).ResolveToHostPath(Required(args, "path"));
                 return Task.FromResult(File.ReadAllText(path));
             })
         {
             ParametersSchema = ObjectSchema([("path", "string", "Virtual file path to read, such as /workspace/README.md.")], ["path"]),
             ResourceAccessResolver = args =>
-                [new ResourceAccess(ResourceAction.Read, ResourceUri.Vafs(Required(args, "path")))],
+                [FileAccess(view, Required(args, "path"), ResourceAction.Read)],
         });
 
-        registry.Register(new ToolDefinition(
+        RegisterFileTool(registry, view => new ToolDefinition(
             "file.write",
             "files",
             "Writes UTF-8 text to a file under writable /workspace, /tmp, or mounted /volumes paths.",
             (args, _) =>
             {
-                var vafs = Vafs();
+                var vafs = view ?? Vafs();
                 var virtualPath = Required(args, "path");
                 var path = vafs.ResolveToHostPath(virtualPath, requireWritable: true);
                 var content = args.TryGetValue("content", out var value) ? value?.ToString() ?? "" : "";
@@ -45,16 +45,16 @@ public static class FileTools
                 ],
                 ["path", "content"]),
             ResourceAccessResolver = args =>
-                [new ResourceAccess(ResourceAction.Write, ResourceUri.Vafs(Required(args, "path")), RequiresApproval: true)],
+                [FileAccess(view, Required(args, "path"), ResourceAction.Write)],
         });
 
-        registry.Register(new ToolDefinition(
+        RegisterFileTool(registry, view => new ToolDefinition(
             "file.patch",
             "files",
             "Replaces exact text in a file under writable /workspace, /tmp, or mounted /volumes paths.",
             (args, _) =>
             {
-                var vafs = Vafs();
+                var vafs = view ?? Vafs();
                 var path = vafs.ResolveToHostPath(Required(args, "path"), requireWritable: true);
                 var oldText = Required(args, "oldText");
                 var newText = args.TryGetValue("newText", out var value) ? value?.ToString() ?? "" : "";
@@ -83,17 +83,17 @@ public static class FileTools
                 ],
                 ["path", "oldText", "newText"]),
             ResourceAccessResolver = args =>
-                [new ResourceAccess(ResourceAction.Write, ResourceUri.Vafs(Required(args, "path")), RequiresApproval: true)],
+                [FileAccess(view, Required(args, "path"), ResourceAction.Write)],
         });
 
-        registry.Register(new ToolDefinition(
+        RegisterFileTool(registry, view => new ToolDefinition(
             "file.list",
             "files",
             "Lists files and directories under /workspace, /tmp, or mounted /volumes paths.",
             (args, _) =>
             {
-                var vafs = Vafs();
-                var requestedPath = args.TryGetValue("path", out var value) ? value?.ToString() ?? "/workspace" : "/workspace";
+                var vafs = view ?? Vafs();
+                var requestedPath = ListPath(args);
                 if (requestedPath == "/")
                 {
                     return Task.FromResult(string.Join(Environment.NewLine, ["/workspace/", "/tmp/", "/volumes/"]));
@@ -121,13 +121,27 @@ public static class FileTools
             ParametersSchema = ObjectSchema(("path", "string", "Virtual directory path to list. Defaults to /workspace.")),
             ResourceAccessResolver = args =>
             {
-                var path = args.TryGetValue("path", out var value)
-                    ? value?.ToString() ?? "/workspace"
-                    : "/workspace";
-                return [new ResourceAccess(ResourceAction.Read, ResourceUri.Vafs(path))];
+                var path = ListPath(args);
+                return [FileAccess(path is "/" or "/volumes" ? null : view, path, ResourceAction.Read)];
             },
         });
     }
+
+    internal static void RegisterFileTool(
+        ToolRegistry registry, Func<VirtualAgentFileSystem?, ToolDefinition> create) =>
+        registry.Register(create(null) with { ResourceViewBinder = view => create(view) });
+
+    internal static ResourceAccess FileAccess(VirtualAgentFileSystem? view, string path, ResourceAction action)
+    {
+        var writable = action == ResourceAction.Write;
+        var resource = view is null
+            ? ResourceUri.Vafs(path)
+            : new ResourceUri($"vafs:{view.ResolveVirtualPath(path, requireWritable: writable)}");
+        return new ResourceAccess(action, resource, RequiresApproval: writable);
+    }
+
+    private static string ListPath(IReadOnlyDictionary<string, object?> args) =>
+        args.TryGetValue("path", out var value) ? value?.ToString() ?? "/workspace" : "/workspace";
 
     internal static string Required(IReadOnlyDictionary<string, object?> args, string key)
     {

@@ -19,7 +19,7 @@ public sealed class VirtualAgentFileSystem
             "/tmp",
             options.TmpHostPath,
             ReadOnly: false));
-        tmpMount = EnsureWritableTmpMount(tmpMount);
+        tmpMount = EnsureWritableTmpMount(tmpMount, options.AllowSharedTmpFallback);
 
         var mounts = new List<VirtualMount>
         {
@@ -36,9 +36,9 @@ public sealed class VirtualAgentFileSystem
             mounts.Add(NormalizeMount(mount));
         }
 
-        _mounts = mounts
+        _mounts = Array.AsReadOnly(mounts
             .OrderByDescending(mount => mount.VirtualPath.Length)
-            .ToArray();
+            .ToArray());
     }
 
     public static VirtualAgentFileSystem FromEnvironment() =>
@@ -46,9 +46,19 @@ public sealed class VirtualAgentFileSystem
 
     public IReadOnlyList<VirtualMount> ListMounts() => _mounts;
 
-    public string ResolveToHostPath(string path, bool requireWritable = false)
+    public string ResolveToHostPath(string path, bool requireWritable = false) =>
+        ResolvePath(path, requireWritable, out _);
+
+    /// <summary>Returns the canonical virtual path after applying the same mount checks as host-path resolution.</summary>
+    public string ResolveVirtualPath(string path, bool requireWritable = false)
     {
-        var virtualPath = NormalizeVirtualPath(path);
+        ResolvePath(path, requireWritable, out var virtualPath);
+        return virtualPath;
+    }
+
+    private string ResolvePath(string path, bool requireWritable, out string virtualPath)
+    {
+        virtualPath = NormalizeVirtualPath(path);
         var mount = FindMountForVirtualPath(virtualPath)
             ?? throw new VirtualPathException(
                 $"Path '{path}' is outside Auxim VAFS. Use /workspace, /tmp, or mounted /volumes paths.");
@@ -150,14 +160,15 @@ public sealed class VirtualAgentFileSystem
         };
     }
 
-    private static VirtualMount EnsureWritableTmpMount(VirtualMount mount)
+    private static VirtualMount EnsureWritableTmpMount(VirtualMount mount, bool allowSharedTmpFallback)
     {
         try
         {
             Directory.CreateDirectory(mount.HostPath);
             return mount;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (allowSharedTmpFallback
+            && (exception is IOException or UnauthorizedAccessException))
         {
             var fallback = Path.Combine(Path.GetTempPath(), "auxim", "vafs-tmp");
             Directory.CreateDirectory(fallback);
@@ -236,21 +247,16 @@ public sealed class VirtualAgentFileSystem
         string hostPath,
         string virtualPath)
     {
-        var physicalRoot = ResolveExistingTarget(mount.HostPath);
+        var remainingLinks = 40;
+        var physicalRoot = ResolvePhysicalPath("", mount.HostPath, ref remainingLinks);
         var relative = Path.GetRelativePath(mount.HostPath, hostPath);
-        var current = mount.HostPath;
+        var current = physicalRoot;
         foreach (var segment in relative.Split(
             [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
             StringSplitOptions.RemoveEmptyEntries))
         {
-            current = Path.Combine(current, segment);
-            if (!File.Exists(current) && !Directory.Exists(current))
-            {
-                break;
-            }
-
-            var physicalCurrent = ResolveExistingTarget(current);
-            if (!IsSameOrChildPath(physicalRoot, physicalCurrent))
+            current = ResolvePhysicalPath(current, segment, ref remainingLinks);
+            if (!IsSameOrChildPath(physicalRoot, current))
             {
                 throw new VirtualPathException(
                     $"Path '{virtualPath}' escapes virtual mount '{mount.VirtualPath}' through a symbolic link.");
@@ -258,13 +264,69 @@ public sealed class VirtualAgentFileSystem
         }
     }
 
-    private static string ResolveExistingTarget(string path)
+    private static string ResolvePhysicalPath(string parent, string path, ref int remainingLinks)
     {
-        FileSystemInfo info = Directory.Exists(path)
+        if (Path.IsPathRooted(path))
+        {
+            if (!Path.IsPathFullyQualified(path))
+            {
+                throw new VirtualPathException("Cannot resolve a partially qualified symbolic link target.");
+            }
+
+            parent = Path.GetPathRoot(path)!;
+            path = path[parent.Length..];
+        }
+
+        foreach (var segment in path.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                parent = Path.GetDirectoryName(parent) ?? parent;
+                continue;
+            }
+
+            var current = Path.Combine(parent, segment);
+            var target = ReadLinkTarget(current);
+            if (target is not null && --remainingLinks < 0)
+            {
+                throw new VirtualPathException("Too many symbolic links while resolving a VAFS path.");
+            }
+
+            // A target can contain linked parent directories, even when its leaf is missing.
+            parent = target is null ? current : ResolvePhysicalPath(parent, target, ref remainingLinks);
+        }
+
+        return parent;
+    }
+
+    private static string? ReadLinkTarget(string path)
+    {
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(path);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+
+        if (!attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            return null;
+        }
+
+        FileSystemInfo info = attributes.HasFlag(FileAttributes.Directory)
             ? new DirectoryInfo(path)
             : new FileInfo(path);
-        return Path.GetFullPath(
-            info.ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? info.FullName);
+        return info.LinkTarget;
     }
 
     private static bool HasWindowsDrivePrefix(string path) =>

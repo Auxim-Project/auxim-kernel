@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Auxim.Core.Approval;
 using Auxim.Core.Resources;
 
@@ -15,6 +16,11 @@ public abstract record RuntimeEvent(
     DateTimeOffset OccurredAt,
     AuximRunId RunId)
 {
+    /// <summary>The Kernel execution identity, when emitted by a context-bound run.</summary>
+    [JsonInclude]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public AuximExecutionId? ExecutionId { get; internal init; }
+
     public abstract string Kind { get; }
 }
 

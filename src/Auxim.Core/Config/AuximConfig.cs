@@ -6,6 +6,23 @@ public sealed class AuximConfig
     public AgentConfig Agent { get; init; } = new();
     public DisplayConfig Display { get; init; } = new();
     public SandboxConfig Sandbox { get; init; } = new();
+
+    internal AuximConfig Snapshot() => new()
+    {
+        Model = Model,
+        Agent = Agent,
+        Display = Display,
+        Sandbox = new SandboxConfig
+        {
+            Workspace = Sandbox.Workspace,
+            Mounts = [.. Sandbox.Mounts],
+            Shell = new ShellSandboxConfig
+            {
+                Enabled = Sandbox.Shell.Enabled,
+                AllowedCommands = [.. Sandbox.Shell.AllowedCommands],
+            },
+        },
+    };
 }
 
 public sealed class ModelConfig

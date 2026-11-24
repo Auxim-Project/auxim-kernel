@@ -35,6 +35,78 @@ coordination checks declared resource accesses through the approval service
 before invoking tools. VAFS and its shell policy provide application-level
 controls, not operating-system process isolation.
 
+### Context-bound execution
+
+`AuximRuntimeService.RunInContextAsync` is an opt-in entry point for trusted
+in-process runners. Implement `IAgentRunner.RunInContextAsync` to receive the
+Kernel-owned `AuximExecutionContext`. Each invocation has a distinct execution
+ID and run ID. It operates without a session and leaves current-session
+selection to the chat API.
+
+Use the context to list and invoke tools and publish content deltas. It captures
+configuration and tool metadata once and associates tools with the configured
+approval and event channels. Scoped events carry an execution ID. The scope
+closes when the runner exits, signals cancellation, and waits for admitted
+operations to finish. Tool and event callbacks must cooperate with cancellation
+for prompt shutdown.
+
+Context tool arguments must be JSON-compatible. Structured values are passed
+to resolvers and handlers as immutable JSON, so an approval applies to the
+arguments captured for that invocation. Exceptions from nonterminal event
+callbacks propagate through the operation. Terminal events are delivered on a
+best-effort basis and delivery failures are logged.
+
+The existing chat and direct tool APIs serve legacy callers. The context entry
+point requires the Kernel's `RuntimeToolService` (or an empty tool catalog).
+Legacy runner and tool service implementations require an explicit upgrade to
+participate. Context binding provides managed execution lifetime and tool
+routing for trusted code. Hosts must keep configuration and schema input stable
+while the Kernel captures them.
+
+The Kernel builds the context's VAFS from the sandbox configuration and
+`AUXIM_WORKSPACE` and `AUXIM_VAFS_MOUNTS` values at context creation. As in
+legacy VAFS, a host environment mount replaces the configured mount of the same
+name, including its read-only setting. The effective mount still governs file
+operations and approval requirements. The environment
+description and bound tools use that view for the lifetime of the context. The
+Kernel creates a unique `/tmp` under the system temporary directory, with no
+shared fallback or `AUXIM_TMP` override. It removes that directory on setup
+failure or after cancellation and admitted operations have finished on close.
+Cleanup verifies directory ownership before deleting recursively. A cleanup
+failure is logged and fails an otherwise successful run. A prior run failure
+or caller cancellation remains the primary outcome. Exceptions from
+cancellation callbacks are logged while close continues to drain and clean up.
+Workspace and volume directories remain host-owned.
+
+In a context, only definitions that supply a `ToolDefinition.ResourceViewBinder`
+are listed and callable. The built-in file read, list, search, write, and patch
+tools bind their declarations and I/O to the same view. Writes require a fresh
+approval for each call. The context path neither reads nor writes the remembered
+approval store. Legacy chat and direct tools continue to use their existing
+mount and approval configuration.
+
+File search validates explicit paths through VAFS and skips symbolic links and
+other reparse points encountered during recursive traversal. It also skips
+`.git` entries. With ripgrep installed, the tool passes bounded batches of
+validated file paths and disables ripgrep configuration and ignore files.
+Without ripgrep, the managed fallback performs case-insensitive literal
+matching. If ripgrep is found but fails to start, search reports the failure.
+The command-line budget includes the executable, flags, pattern, and file
+paths, and the result limit applies across the entire invocation.
+
+Errors opening the requested path fail the search. Unreadable descendants
+that can be attributed to an individual path are skipped and reported alongside
+any matches. Search diagnostics use virtual paths and omit raw subprocess
+diagnostics. Cancellation requests termination of the ripgrep process tree.
+The wait for termination and the drain after process exit have time limits.
+Unconfirmed cleanup is reported without changing the original search outcome.
+
+VAFS fixes the mount table. Host files and links can still change in place, and
+configured mounts can overlap across contexts. This is an application-level
+resource view for trusted in-process tools. Ripgrep runs with host process
+privileges, and filesystem changes between path validation and file open can
+still affect what either search engine reads.
+
 ## Getting Started
 
 ### Use the published package

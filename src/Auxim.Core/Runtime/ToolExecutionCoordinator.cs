@@ -1,4 +1,5 @@
 using Auxim.Core.Approval;
+using Auxim.Core.Logging;
 using Auxim.Core.Resources;
 using Auxim.Core.Tools;
 
@@ -8,6 +9,7 @@ internal sealed class ToolExecutionCoordinator
 {
     private readonly ToolRegistry _tools;
     private readonly ToolApprovalService _approvals;
+    private readonly string _homeDirectory;
     private readonly IApprovalHandler _approvalHandler;
     private readonly IRuntimeEventSink _eventSink;
 
@@ -15,10 +17,12 @@ internal sealed class ToolExecutionCoordinator
         ToolRegistry tools,
         string homeDirectory,
         IApprovalHandler approvalHandler,
-        IRuntimeEventSink eventSink)
+        IRuntimeEventSink eventSink,
+        bool allowRememberedGrants = true)
     {
         _tools = tools;
-        _approvals = new ToolApprovalService(homeDirectory);
+        _approvals = new ToolApprovalService(homeDirectory, allowRememberedGrants);
+        _homeDirectory = homeDirectory;
         _approvalHandler = approvalHandler;
         _eventSink = eventSink;
     }
@@ -28,7 +32,7 @@ internal sealed class ToolExecutionCoordinator
         IReadOnlyDictionary<string, object?> arguments) =>
         _tools.Get(toolName).ResolveResourceAccesses(arguments);
 
-    public async Task<ToolExecutionResult> ExecuteAsync(
+    public async Task<string> ExecuteAsync(
         AuximRunId runId,
         string toolCallId,
         string toolName,
@@ -36,48 +40,61 @@ internal sealed class ToolExecutionCoordinator
         CancellationToken cancellationToken)
     {
         var definition = _tools.Get(toolName);
-        var accesses = definition.ResolveResourceAccesses(arguments);
-        await _eventSink.PublishAsync(
-            new RuntimeToolStartedEvent(
-                RuntimeEventFactory.NewEventId(),
-                RuntimeEventFactory.Now(),
-                runId,
-                toolCallId,
-                toolName,
-                accesses),
-            cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        var accesses = Array.AsReadOnly(definition.ResolveResourceAccesses(arguments).ToArray());
 
-        var approval = await _approvals.ReviewAsync(
-            runId,
-            toolName,
-            arguments,
-            accesses,
-            _approvalHandler,
-            _eventSink,
-            cancellationToken);
+        ApprovalResponse approval;
+        var content = "";
+        var outputLength = 0;
+        try
+        {
+            await _eventSink.PublishAsync(
+                new RuntimeToolStartedEvent(
+                    RuntimeEventFactory.NewEventId(),
+                    RuntimeEventFactory.Now(),
+                    runId,
+                    toolCallId,
+                    toolName,
+                    accesses),
+                cancellationToken);
+
+            approval = await _approvals.ReviewAsync(
+                runId, toolName, arguments, accesses, _approvalHandler, _eventSink, cancellationToken);
+            if (approval.Approved)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                content = await definition.Handler(arguments, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                outputLength = content.Length;
+            }
+        }
+        catch (Exception exception)
+        {
+            var outcome = exception is OperationCanceledException && cancellationToken.IsCancellationRequested
+                ? "canceled"
+                : "failed";
+            try
+            {
+                await PublishCompletedAsync(runId, toolCallId, toolName, outcome, 0, cancellationToken);
+            }
+            catch (Exception deliveryFailure)
+            {
+                AuximLog.Warning(
+                    $"Failed to deliver tool.completed for run {runId}, tool call {toolCallId}: {deliveryFailure.Message}",
+                    _homeDirectory);
+            }
+
+            throw;
+        }
+
         if (!approval.Approved)
         {
             await PublishCompletedAsync(runId, toolCallId, toolName, "denied", 0, cancellationToken);
-            return ToolExecutionResult.Denied(toolName, approval.Reason);
+            throw new ToolApprovalDeniedException(toolName, approval.Reason);
         }
 
-        try
-        {
-            var content = await definition.Handler(arguments, cancellationToken);
-            await PublishCompletedAsync(
-                runId,
-                toolCallId,
-                toolName,
-                "succeeded",
-                content.Length,
-                cancellationToken);
-            return ToolExecutionResult.Succeeded(toolName, content);
-        }
-        catch
-        {
-            await PublishCompletedAsync(runId, toolCallId, toolName, "failed", 0, cancellationToken);
-            throw;
-        }
+        await PublishCompletedAsync(runId, toolCallId, toolName, "succeeded", outputLength, cancellationToken);
+        return content;
     }
 
     private ValueTask PublishCompletedAsync(
@@ -97,17 +114,4 @@ internal sealed class ToolExecutionCoordinator
                 outcome,
                 outputLength),
             cancellationToken);
-}
-
-internal sealed record ToolExecutionResult(
-    string ToolName,
-    string Content,
-    bool WasDenied,
-    string Feedback)
-{
-    public static ToolExecutionResult Succeeded(string toolName, string content) =>
-        new(toolName, content, false, "");
-
-    public static ToolExecutionResult Denied(string toolName, string feedback) =>
-        new(toolName, "", true, feedback);
 }

@@ -3,6 +3,7 @@ namespace Auxim.Core.Tools;
 public sealed class ToolRegistry
 {
     private readonly Dictionary<string, ToolDefinition> _tools = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _gate = new();
 
     public void Register(ToolDefinition definition)
     {
@@ -11,19 +12,28 @@ public sealed class ToolRegistry
             throw new ArgumentException("Tool name is required.", nameof(definition));
         }
 
-        _tools[definition.Name] = definition;
+        lock (_gate)
+        {
+            _tools[definition.Name] = definition;
+        }
     }
 
-    public IReadOnlyCollection<ToolDefinition> List() => _tools.Values.ToArray();
+    public IReadOnlyCollection<ToolDefinition> List()
+    {
+        lock (_gate)
+        {
+            return _tools.Values.ToArray();
+        }
+    }
 
     public ToolDefinition Get(string name)
     {
-        if (!_tools.TryGetValue(name, out var definition))
+        lock (_gate)
         {
-            throw new InvalidOperationException($"Tool '{name}' is not registered.");
+            return _tools.TryGetValue(name, out var definition)
+                ? definition
+                : throw new InvalidOperationException($"Tool '{name}' is not registered.");
         }
-
-        return definition;
     }
 
     public async Task<string> InvokeAsync(

@@ -220,9 +220,12 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         }
     }
 
-    private IRuntimeEventSink CreateEventSink(IRuntimeEventSink? frontendSink)
+    private IRuntimeEventSink CreateEventSink(IRuntimeEventSink? frontendSink) =>
+        CreateEventSink(_homeDirectory(), frontendSink);
+
+    private static IRuntimeEventSink CreateEventSink(string homeDirectory, IRuntimeEventSink? frontendSink)
     {
-        var logSink = new RuntimeLogEventSink(_homeDirectory());
+        var logSink = new RuntimeLogEventSink(homeDirectory);
         return frontendSink is null
             ? logSink
             : new CompositeRuntimeEventSink(logSink, frontendSink);
