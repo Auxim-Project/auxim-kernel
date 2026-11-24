@@ -43,7 +43,8 @@ public static class SearchTools
     {
         try
         {
-            return FileTools.FileAccess(view, path, ResourceAction.Read);
+            // The target may be a directory when the handler starts.
+            return FileTools.FileAccess(view, path, ResourceAction.Read) with { IncludeDescendants = view is not null };
         }
         catch (Exception error) when (IsPathFailure(error))
         {

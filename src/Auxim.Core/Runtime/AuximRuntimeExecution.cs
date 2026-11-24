@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using Auxim.Core.Approval;
 using Auxim.Core.Logging;
 using Auxim.Core.Tools;
@@ -21,6 +22,17 @@ public sealed partial class AuximRuntimeService
         ArgumentException.ThrowIfNullOrWhiteSpace(userInput);
         cancellationToken.ThrowIfCancellationRequested();
 
+        var allowedToolNames = options?.AllowedToolNames?.Select(name =>
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException(
+                    "AllowedToolNames cannot contain null, empty, or whitespace-only names.", nameof(options));
+            }
+
+            return name;
+        }).ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+        var resourcePermissions = options?.ResourcePermissions?.ToArray();
         var configuration = _configLoader().Snapshot();
         var registry = _tools switch
         {
@@ -30,12 +42,13 @@ public sealed partial class AuximRuntimeService
                 "Context-bound execution requires a RuntimeToolService with a capturable tool catalog."),
         };
         var homeDirectory = _homeDirectory();
-        var resources = new ExecutionResourceView(configuration.Sandbox, homeDirectory);
+        var resources = new ExecutionResourceView(configuration.Sandbox, homeDirectory,
+            followDirectoryLinksInListings: resourcePermissions is null);
         AuximExecutionContext context;
         try
         {
             context = new AuximExecutionContext(
-                configuration, resources, registry, homeDirectory,
+                configuration, resources, registry, allowedToolNames, resourcePermissions, homeDirectory,
                 options?.ApprovalHandler ?? NonInteractiveApprovalHandler.Instance,
                 CreateEventSink(homeDirectory, options?.EventSink),
                 cancellationToken);

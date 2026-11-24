@@ -338,6 +338,128 @@ public sealed class AuximExecutionContextTests : IDisposable
     }
 
     [Fact]
+    public async Task ToolAllowlistFiltersBindingDiscoveryResourceDeclarationsAndInvocation()
+    {
+        var registry = new ToolRegistry();
+        RegisterContextTool(registry, new ToolDefinition("read.allowed", "test", "", (_, _) => Task.FromResult("allowed"))
+        {
+            ResourceAccessResolver = _ => [new ResourceAccess(ResourceAction.Read, new ResourceUri("test:allowed"))],
+        });
+        registry.Register(new ToolDefinition("write.denied", "test", "", (_, _) => Task.FromResult("denied"))
+        {
+            ResourceAccessResolver = _ => [new ResourceAccess(ResourceAction.Write, new ResourceUri("test:denied"))],
+            ResourceViewBinder = _ => throw new InvalidOperationException("An excluded tool must not be bound."),
+        });
+        registry.Register(new ToolDefinition("unbound", "test", "", (_, _) => Task.FromResult("unbound")));
+        var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
+        {
+            Assert.Equal("read.allowed", Assert.Single(context.ListTools()).Name);
+            var access = Assert.Single(context.ResolveToolResourceAccesses("READ.ALLOWED", NoArguments));
+            Assert.Equal("test:allowed", access.Resource.Value);
+            foreach (var name in new[] { "write.denied", "unbound", "unknown" })
+            {
+                Assert.Throws<InvalidOperationException>(() => context.ResolveToolResourceAccesses(name, NoArguments));
+                await Assert.ThrowsAsync<InvalidOperationException>(() => context.InvokeToolAsync(name, NoArguments));
+            }
+
+            return new AgentResult(await context.InvokeToolAsync("READ.ALLOWED", NoArguments), []);
+        }), new RuntimeToolService(() => registry));
+
+        var result = await runtime.RunInContextAsync("run", new AuximRuntimeOptions
+        {
+            AllowedToolNames = ["READ.ALLOWED", "write_denied", "unbound", "unknown"],
+        });
+        Assert.Equal("allowed", result.FinalResponse);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NullToolAllowlistKeepsTheExistingCatalogAndEmptyAllowlistDeniesAll(bool denyAll)
+    {
+        var registry = new ToolRegistry();
+        RegisterContextTool(registry, new ToolDefinition("echo", "test", "", (_, _) => Task.FromResult("echo")));
+        var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
+        {
+            if (denyAll)
+            {
+                Assert.Empty(context.ListTools());
+                Assert.Throws<InvalidOperationException>(() => context.ResolveToolResourceAccesses("echo", NoArguments));
+                await Assert.ThrowsAsync<InvalidOperationException>(() => context.InvokeToolAsync("echo", NoArguments));
+                return new AgentResult("denied", []);
+            }
+
+            Assert.Equal("echo", Assert.Single(context.ListTools()).Name);
+            Assert.Empty(context.ResolveToolResourceAccesses("echo", NoArguments));
+            return new AgentResult(await context.InvokeToolAsync("echo", NoArguments), []);
+        }), new RuntimeToolService(() => registry));
+
+        var result = await runtime.RunInContextAsync("run", new AuximRuntimeOptions
+        {
+            AllowedToolNames = denyAll ? [] : null,
+        });
+        Assert.Equal(denyAll ? "denied" : "echo", result.FinalResponse);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" \t ")]
+    public async Task InvalidToolAllowlistEntriesAreRejectedBeforeContextSetup(string? name)
+    {
+        var runtime = CreateRuntime(new LegacyRunner(), configuration: () =>
+            throw new InvalidOperationException("Configuration must not be loaded for an invalid allowlist."));
+        var options = new AuximRuntimeOptions { AllowedToolNames = ["valid", name!] };
+
+        var error = await Assert.ThrowsAsync<ArgumentException>("options", () =>
+            runtime.RunInContextAsync("run", options));
+        Assert.Contains("AllowedToolNames cannot contain null, empty, or whitespace-only names.", error.Message);
+    }
+
+    [Fact]
+    public async Task ConcurrentContextsKeepIndependentSnapshotsOfTheHostToolAllowlist()
+    {
+        var registry = new ToolRegistry();
+        RegisterContextTool(registry, new ToolDefinition("first", "test", "", (_, _) => Task.FromResult("first")));
+        RegisterContextTool(registry, new ToolDefinition("second", "test", "", (_, _) => Task.FromResult("second")));
+        var firstEntered = NewSignal();
+        var secondEntered = NewSignal();
+        var toolsMayRun = NewSignal();
+        var runtime = CreateRuntime(new ContextRunner(async (name, context) =>
+        {
+            (name == "first" ? firstEntered : secondEntered).SetResult();
+            await toolsMayRun.Task.WaitAsync(TestTimeout, context.CancellationToken);
+            Assert.Equal(name, Assert.Single(context.ListTools()).Name);
+            var denied = name == "first" ? "second" : "first";
+            Assert.Throws<InvalidOperationException>(() => context.ResolveToolResourceAccesses(denied, NoArguments));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => context.InvokeToolAsync(denied, NoArguments));
+            return new AgentResult(await context.InvokeToolAsync(name, NoArguments), []);
+        }), new RuntimeToolService(() => registry));
+
+        var names = new List<string> { "first" };
+        var options = new AuximRuntimeOptions { AllowedToolNames = names };
+        var first = runtime.RunInContextAsync("first", options);
+        Task<AgentResult> second;
+        try
+        {
+            await firstEntered.Task.WaitAsync(TestTimeout);
+            names[0] = "second";
+            second = runtime.RunInContextAsync("second", options);
+            await secondEntered.Task.WaitAsync(TestTimeout);
+            names.Clear();
+            Assert.False(first.IsCompleted);
+            Assert.False(second.IsCompleted);
+        }
+        finally
+        {
+            toolsMayRun.TrySetResult();
+        }
+
+        var results = await Task.WhenAll(first, second).WaitAsync(TestTimeout);
+        Assert.Equal(["first", "second"], results.Select(result => result.FinalResponse));
+    }
+
+    [Fact]
     public async Task ApprovalAndHandlerUseTheSameDetachedArgumentsAndResourceDeclarations()
     {
         var payload = new Dictionary<string, string> { ["path"] = "original" };
@@ -515,13 +637,14 @@ public sealed class AuximExecutionContextTests : IDisposable
     [Fact]
     public async Task LegacyRunnerAndToolServiceAreOnlyUsedByLegacyEntries()
     {
+        var options = new AuximRuntimeOptions { AllowedToolNames = null };
         var legacyRunner = new LegacyRunner();
         var runtime = CreateRuntime(legacyRunner);
         await Assert.ThrowsAsync<NotSupportedException>(() => runtime.RunInContextAsync("unsupported"));
         Assert.Equal(0, legacyRunner.Calls);
         Assert.False(Directory.Exists(Path.Combine(_home, "sessions")));
 
-        Assert.Equal("legacy", (await runtime.ChatAsync(new AuximChatRequest("chat"))).FinalResponse);
+        Assert.Equal("legacy", (await runtime.ChatAsync(new AuximChatRequest("chat"), options)).FinalResponse);
         Assert.Equal(1, legacyRunner.Calls);
 
         var customTools = new LegacyToolService();
@@ -529,7 +652,7 @@ public sealed class AuximExecutionContextTests : IDisposable
             throw new InvalidOperationException("Runner should never run")), customTools);
         await Assert.ThrowsAsync<NotSupportedException>(() => runtime.RunInContextAsync("unsupported"));
         Assert.Equal(0, customTools.Invocations);
-        Assert.Equal("legacy tool", await runtime.InvokeToolAsync("tool", NoArguments));
+        Assert.Equal("legacy tool", await runtime.InvokeToolAsync("tool", NoArguments, options));
         Assert.Equal(1, customTools.Invocations);
     }
 

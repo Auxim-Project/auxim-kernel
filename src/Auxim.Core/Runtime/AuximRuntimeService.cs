@@ -56,6 +56,7 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         AuximRuntimeOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        RejectLegacyPermissions(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(arguments);
         var runId = AuximRunId.New();
@@ -159,6 +160,7 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         AuximRuntimeOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        RejectLegacyPermissions(options);
         if (string.IsNullOrWhiteSpace(request.Prompt))
         {
             throw new ArgumentException("Prompt is required.", nameof(request));
@@ -217,6 +219,19 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
                     exception.Message),
                 CancellationToken.None);
             throw;
+        }
+    }
+
+    private static void RejectLegacyPermissions(AuximRuntimeOptions? options)
+    {
+        if (options?.AllowedToolNames is not null)
+        {
+            throw new ArgumentException("AllowedToolNames is supported only by RunInContextAsync.", nameof(options));
+        }
+
+        if (options?.ResourcePermissions is not null)
+        {
+            throw new ArgumentException("ResourcePermissions is supported only by RunInContextAsync.", nameof(options));
         }
     }
 

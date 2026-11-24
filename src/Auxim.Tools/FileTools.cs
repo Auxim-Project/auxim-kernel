@@ -83,7 +83,10 @@ public static class FileTools
                 ],
                 ["path", "oldText", "newText"]),
             ResourceAccessResolver = args =>
-                [FileAccess(view, Required(args, "path"), ResourceAction.Write)],
+            {
+                var write = FileAccess(view, Required(args, "path"), ResourceAction.Write);
+                return view is null ? [write] : [write with { Action = ResourceAction.Read, RequiresApproval = false }, write];
+            },
         });
 
         RegisterFileTool(registry, view => new ToolDefinition(
@@ -110,11 +113,9 @@ public static class FileTools
                 }
 
                 var path = vafs.ResolveToHostPath(requestedPath);
-                var entries = Directory.EnumerateFileSystemEntries(path)
-                    .OrderBy(entry => entry)
-                    .Select(entry => Directory.Exists(entry)
-                        ? vafs.ToVirtualPath(entry) + "/"
-                        : vafs.ToVirtualPath(entry));
+                var entries = new DirectoryInfo(path).EnumerateFileSystemInfos()
+                    .OrderBy(entry => entry.FullName)
+                    .Select(entry => vafs.ToVirtualPath(entry.FullName) + (vafs.IsDirectoryForListing(entry) ? "/" : ""));
                 return Task.FromResult(string.Join(Environment.NewLine, entries));
             })
         {
@@ -122,7 +123,12 @@ public static class FileTools
             ResourceAccessResolver = args =>
             {
                 var path = ListPath(args);
-                return [FileAccess(path is "/" or "/volumes" ? null : view, path, ResourceAction.Read)];
+                if (path is "/" or "/volumes")
+                {
+                    return [FileAccess(null, path, ResourceAction.Read)];
+                }
+
+                return [FileAccess(view, path, ResourceAction.Read) with { IncludeDescendants = view is not null }];
             },
         });
     }

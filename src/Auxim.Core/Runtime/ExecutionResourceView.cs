@@ -9,7 +9,7 @@ internal sealed class ExecutionResourceView : IDisposable
     private readonly DirectoryInfo _temporaryDirectory;
     private readonly string _ownershipMarker = $".auxim-owner-{Guid.NewGuid():N}";
 
-    public ExecutionResourceView(SandboxConfig sandbox, string homeDirectory)
+    public ExecutionResourceView(SandboxConfig sandbox, string homeDirectory, bool followDirectoryLinksInListings)
     {
         _temporaryDirectory = Directory.CreateTempSubdirectory("auxim-execution-");
         try
@@ -22,7 +22,7 @@ internal sealed class ExecutionResourceView : IDisposable
             var mounts = sandbox.Mounts.Select(mount => new VirtualMount(
                 mount.Name, $"/volumes/{mount.Name}", mount.HostPath, mount.ReadOnly));
             FileSystem = new VirtualAgentFileSystem(VirtualAgentFileSystemOptions.CaptureMountsFromEnvironment(
-                sandbox.Workspace, mounts, _temporaryDirectory.FullName));
+                sandbox.Workspace, mounts, _temporaryDirectory.FullName), followDirectoryLinksInListings);
         }
         catch
         {

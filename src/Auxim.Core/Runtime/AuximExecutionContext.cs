@@ -36,6 +36,8 @@ public sealed class AuximExecutionContext
         AuximConfig configuration,
         ExecutionResourceView resources,
         ToolRegistry registry,
+        IReadOnlySet<string>? allowedToolNames,
+        IReadOnlyList<VafsResourcePermission>? resourcePermissions,
         string homeDirectory,
         IApprovalHandler approvalHandler,
         IRuntimeEventSink eventSink,
@@ -43,10 +45,14 @@ public sealed class AuximExecutionContext
     {
         _configuration = configuration;
         _resources = resources;
+        var resourcePolicy = resourcePermissions is null
+            ? null
+            : new VafsResourcePermissionPolicy(resources.FileSystem, resourcePermissions);
         var snapshot = new ToolRegistry();
         foreach (var definition in registry.List())
         {
-            if (definition.ResourceViewBinder is not { } bind)
+            if ((allowedToolNames is not null && !allowedToolNames.Contains(definition.Name))
+                || definition.ResourceViewBinder is not { } bind)
             {
                 continue;
             }
@@ -88,7 +94,7 @@ public sealed class AuximExecutionContext
             await eventSink.PublishAsync(contextualEvent, token);
         });
         _tools = new ToolExecutionCoordinator(snapshot, homeDirectory, approvalHandler, EventSink,
-            allowRememberedGrants: false);
+            allowRememberedGrants: false, resourcePolicy: resourcePolicy);
         _lifetime = new CancellationTokenSource();
         CancellationToken = _lifetime.Token;
         _callerCancellation = cancellationToken.UnsafeRegister(static state =>

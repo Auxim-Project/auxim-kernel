@@ -12,25 +12,31 @@ internal sealed class ToolExecutionCoordinator
     private readonly string _homeDirectory;
     private readonly IApprovalHandler _approvalHandler;
     private readonly IRuntimeEventSink _eventSink;
+    private readonly VafsResourcePermissionPolicy? _resourcePolicy;
 
     public ToolExecutionCoordinator(
         ToolRegistry tools,
         string homeDirectory,
         IApprovalHandler approvalHandler,
         IRuntimeEventSink eventSink,
-        bool allowRememberedGrants = true)
+        bool allowRememberedGrants = true,
+        VafsResourcePermissionPolicy? resourcePolicy = null)
     {
         _tools = tools;
         _approvals = new ToolApprovalService(homeDirectory, allowRememberedGrants);
         _homeDirectory = homeDirectory;
         _approvalHandler = approvalHandler;
         _eventSink = eventSink;
+        _resourcePolicy = resourcePolicy;
     }
 
     public IReadOnlyList<ResourceAccess> ResolveResourceAccesses(
         string toolName,
-        IReadOnlyDictionary<string, object?> arguments) =>
-        _tools.Get(toolName).ResolveResourceAccesses(arguments);
+        IReadOnlyDictionary<string, object?> arguments)
+    {
+        var accesses = _tools.Get(toolName).ResolveResourceAccesses(arguments);
+        return _resourcePolicy is null ? accesses : CheckResourceAccesses(toolName, accesses);
+    }
 
     public async Task<string> ExecuteAsync(
         AuximRunId runId,
@@ -41,7 +47,7 @@ internal sealed class ToolExecutionCoordinator
     {
         var definition = _tools.Get(toolName);
         cancellationToken.ThrowIfCancellationRequested();
-        var accesses = Array.AsReadOnly(definition.ResolveResourceAccesses(arguments).ToArray());
+        var accesses = CheckResourceAccesses(toolName, definition.ResolveResourceAccesses(arguments));
 
         ApprovalResponse approval;
         var content = "";
@@ -63,6 +69,7 @@ internal sealed class ToolExecutionCoordinator
             if (approval.Approved)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                _resourcePolicy?.EnsureAllowed(toolName, accesses);
                 content = await definition.Handler(arguments, cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 outputLength = content.Length;
@@ -95,6 +102,13 @@ internal sealed class ToolExecutionCoordinator
 
         await PublishCompletedAsync(runId, toolCallId, toolName, "succeeded", outputLength, cancellationToken);
         return content;
+    }
+
+    private IReadOnlyList<ResourceAccess> CheckResourceAccesses(string toolName, IReadOnlyList<ResourceAccess> accesses)
+    {
+        var snapshot = Array.AsReadOnly(accesses.ToArray());
+        _resourcePolicy?.EnsureAllowed(toolName, snapshot);
+        return snapshot;
     }
 
     private ValueTask PublishCompletedAsync(

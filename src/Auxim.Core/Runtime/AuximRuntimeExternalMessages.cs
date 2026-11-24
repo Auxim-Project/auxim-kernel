@@ -19,6 +19,7 @@ public sealed partial class AuximRuntimeService
         AuximRuntimeOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        RejectLegacyPermissions(options);
         ValidateExternalMessage(request);
         var conversation = GetOrCreateExternalConversation(request);
         var result = await ChatAsync(

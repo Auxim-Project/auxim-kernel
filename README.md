@@ -85,6 +85,41 @@ approval for each call. The context path neither reads nor writes the remembered
 approval store. Legacy chat and direct tools continue to use their existing
 mount and approval configuration.
 
+Trusted hosts can set `AuximRuntimeOptions.AllowedToolNames` when starting a
+context-bound run. The Kernel snapshots the names before binding tools and
+uses the resulting catalog for listing, resource declarations, and execution.
+Names match registered tool names without regard to case. A null list leaves
+the existing context catalog available, and an empty list allows no tools.
+Null, empty, and whitespace-only entries are rejected. Valid names absent
+from the context catalog grant no access. Legacy chat, direct tool calls, and
+external messages reject a non-null list before starting work.
+
+Trusted hosts can also set `AuximRuntimeOptions.ResourcePermissions` to a list
+of `VafsResourcePermission` grants. The Kernel snapshots the list for each
+context, and checks every declared access during preview, before approval, and
+again before execution. Null leaves resource permissions unrestricted by this
+option. An empty list grants no resource access. Legacy entry points reject a
+non-null list before starting work.
+
+Grants use canonical, case-sensitive virtual paths and separate read from write.
+An exact grant covers only its path. Set `IncludeDescendants` to cover a
+subtree. Synthetic `/` and `/volumes` allow exact metadata reads only. Listing
+a mounted directory and searching require a subtree read grant. Search
+declares a subtree even when the supplied target currently resolves to a file.
+Patching requires both read and write access, and restricted writes require
+an existing parent directory. Writes still go through the existing approval
+flow. Missing or unsupported resource declarations are denied.
+
+Restricted views reject overlapping mount roots and links below a mount when
+resolving declared targets. Existing path components must use their exact
+filesystem names. Virtual mount prefixes are case-sensitive. On Unix, verified
+existing host roots can be distinct by case. Unresolved roots and Windows
+roots use conservative case-insensitive overlap checks. Restricted directory
+listings do not classify links by their targets. These checks apply to trusted
+tool declarations and the bound view. They do not establish file identity
+across hard links or OS mount aliases, nor do they eliminate races between
+validation and I/O.
+
 File search validates explicit paths through VAFS and skips symbolic links and
 other reparse points encountered during recursive traversal. It also skips
 `.git` entries. With ripgrep installed, the tool passes bounded batches of
