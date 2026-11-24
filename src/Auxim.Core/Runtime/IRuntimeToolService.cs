@@ -46,9 +46,10 @@ public sealed class RuntimeToolService : IRuntimeToolService
         _toolRegistryFactory = toolRegistryFactory;
     }
 
-    public IReadOnlyList<AuximRuntimeTool> ListTools() =>
-        _toolRegistryFactory()
-            .List()
+    public IReadOnlyList<AuximRuntimeTool> ListTools() => DescribeTools(_toolRegistryFactory()).ToArray();
+
+    internal static IEnumerable<AuximRuntimeTool> DescribeTools(ToolRegistry registry) =>
+        registry.List()
             .OrderBy(tool => tool.Name, StringComparer.OrdinalIgnoreCase)
             .Select(tool => new AuximRuntimeTool(
                 tool.Name,
@@ -56,8 +57,9 @@ public sealed class RuntimeToolService : IRuntimeToolService
                 tool.Toolset,
                 tool.Description,
                 tool.ParametersSchema,
-                tool.ResourceAccessResolver is not null))
-            .ToArray();
+                tool.ResourceAccessResolver is not null));
+
+    internal ToolRegistry CreateRegistry() => _toolRegistryFactory();
 
     public IReadOnlyList<ResourceAccess> ResolveResourceAccesses(
         string name,
@@ -72,25 +74,12 @@ public sealed class RuntimeToolService : IRuntimeToolService
         string homeDirectory,
         IApprovalHandler approvalHandler,
         IRuntimeEventSink eventSink,
-        CancellationToken cancellationToken)
-    {
-        var execution = await new ToolExecutionCoordinator(
+        CancellationToken cancellationToken) =>
+        await new ToolExecutionCoordinator(
             _toolRegistryFactory(),
             homeDirectory,
             approvalHandler,
-            eventSink).ExecuteAsync(
-                runId,
-                toolCallId,
-                name,
-                arguments,
-                cancellationToken);
-        if (execution.WasDenied)
-        {
-            throw new ToolApprovalDeniedException(name, execution.Feedback);
-        }
-
-        return execution.Content;
-    }
+            eventSink).ExecuteAsync(runId, toolCallId, name, arguments, cancellationToken);
 }
 
 internal sealed class EmptyRuntimeToolService : IRuntimeToolService

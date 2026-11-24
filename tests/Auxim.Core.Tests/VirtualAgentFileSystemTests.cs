@@ -5,6 +5,7 @@ using Xunit;
 
 namespace Auxim.Core.Tests;
 
+[Collection("VAFS environment")]
 public sealed class VirtualAgentFileSystemTests : IDisposable
 {
     private readonly string _workspace;
@@ -49,6 +50,23 @@ public sealed class VirtualAgentFileSystemTests : IDisposable
 
         Assert.Equal(Path.Combine(_workspace, "README.md"), hostPath);
         Assert.Equal("/workspace/README.md", virtualPath);
+    }
+
+    [Fact]
+    public void ResolvesDescendantsWhenWorkspaceIsAFilesystemRoot()
+    {
+        var file = Path.Combine(_workspace, "README.md");
+        var root = Path.GetPathRoot(file)!;
+        var relativePath = Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/');
+        var vafs = new VirtualAgentFileSystem(new VirtualAgentFileSystemOptions
+        {
+            WorkspaceHostPath = root,
+            TmpHostPath = _tmp,
+        });
+
+        Assert.Equal(file, vafs.ResolveToHostPath($"/workspace/{relativePath}"));
+        Assert.Equal($"/workspace/{relativePath}", vafs.ToVirtualPath(file));
+        Assert.Throws<VirtualPathException>(() => vafs.ResolveToHostPath($"/workspace/../../{relativePath}"));
     }
 
     [Fact]

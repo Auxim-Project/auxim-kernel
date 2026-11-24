@@ -7,6 +7,8 @@ namespace Auxim.Tools;
 
 public static class TodoTools
 {
+    private static readonly object TodoGate = new();
+
     public static void Register(ToolRegistry registry)
     {
         registry.Register(new ToolDefinition(
@@ -16,10 +18,12 @@ public static class TodoTools
             (args, _) =>
             {
                 var text = FileTools.Required(args, "text");
-                var todos = LoadTodos();
-                var todo = new TodoItem(Guid.NewGuid().ToString("N")[..8], text, false, DateTimeOffset.UtcNow);
-                todos.Add(todo);
-                SaveTodos(todos);
+                var todo = UpdateTodos(todos =>
+                {
+                    var added = new TodoItem(Guid.NewGuid().ToString("N")[..8], text, false, DateTimeOffset.UtcNow);
+                    todos.Add(added);
+                    return added;
+                });
                 return Task.FromResult($"Added todo {todo.Id}: {todo.Text}");
             })
         {
@@ -34,7 +38,7 @@ public static class TodoTools
             "Lists todo items.",
             (_, _) =>
             {
-                var todos = LoadTodos();
+                var todos = ReadTodos();
                 if (todos.Count == 0)
                 {
                     return Task.FromResult("No todos.");
@@ -55,11 +59,13 @@ public static class TodoTools
             (args, _) =>
             {
                 var id = FileTools.Required(args, "id");
-                var todos = LoadTodos();
-                var todo = todos.FirstOrDefault(item => item.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
-                    ?? throw new InvalidOperationException($"Todo '{id}' not found.");
-                todo.Done = true;
-                SaveTodos(todos);
+                var todo = UpdateTodos(todos =>
+                {
+                    var completed = todos.FirstOrDefault(item => item.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
+                        ?? throw new InvalidOperationException($"Todo '{id}' not found.");
+                    completed.Done = true;
+                    return completed;
+                });
                 return Task.FromResult($"Marked done: {todo.Id}");
             })
         {
@@ -72,23 +78,68 @@ public static class TodoTools
         });
     }
 
-    private static List<TodoItem> LoadTodos()
+    private static List<TodoItem> ReadTodos()
     {
         var path = TodoPath();
+        lock (TodoGate)
+        {
+            return LoadTodos(path);
+        }
+    }
+
+    private static TodoItem UpdateTodos(Func<List<TodoItem>, TodoItem> update)
+    {
+        var path = TodoPath();
+        lock (TodoGate)
+        {
+            var todos = LoadTodos(path);
+            var result = update(todos);
+            SaveTodos(path, todos);
+            return result;
+        }
+    }
+
+    private static List<TodoItem> LoadTodos(string path)
+    {
         if (!File.Exists(path))
         {
             return [];
         }
 
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<List<TodoItem>>(json, JsonOptions()) ?? [];
+        try
+        {
+            return JsonSerializer.Deserialize<List<TodoItem>>(json, JsonOptions()) ?? [];
+        }
+        catch (JsonException exception)
+        {
+            // Never rewrite a file that could not be read; that would discard the user's todos.
+            throw new InvalidOperationException(
+                $"Todo file '{path}' is not valid JSON ({exception.Message}). Repair or remove the file and try again.",
+                exception);
+        }
     }
 
-    private static void SaveTodos(List<TodoItem> todos)
+    private static void SaveTodos(string path, List<TodoItem> todos)
     {
-        var path = TodoPath();
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-        File.WriteAllText(path, JsonSerializer.Serialize(todos, JsonOptions()) + Environment.NewLine);
+        var tempPath = $"{path}.{Guid.NewGuid():N}.tmp";
+        File.WriteAllText(tempPath, JsonSerializer.Serialize(todos, JsonOptions()) + Environment.NewLine);
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Replace(tempPath, path, null);
+            }
+            else
+            {
+                File.Move(tempPath, path);
+            }
+        }
+        catch (IOException) when (File.Exists(path) && File.Exists(tempPath))
+        {
+            File.Replace(tempPath, path, null);
+        }
     }
 
     private static string TodoPath() => Path.Combine(ConfigLoader.GetAuximHome(), "todos.json");

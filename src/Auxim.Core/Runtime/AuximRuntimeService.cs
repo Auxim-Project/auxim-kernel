@@ -56,6 +56,7 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         AuximRuntimeOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        RejectLegacyPermissions(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(arguments);
         var runId = AuximRunId.New();
@@ -159,6 +160,7 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         AuximRuntimeOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        RejectLegacyPermissions(options);
         if (string.IsNullOrWhiteSpace(request.Prompt))
         {
             throw new ArgumentException("Prompt is required.", nameof(request));
@@ -220,9 +222,25 @@ public sealed partial class AuximRuntimeService : IAuximRuntime
         }
     }
 
-    private IRuntimeEventSink CreateEventSink(IRuntimeEventSink? frontendSink)
+    private static void RejectLegacyPermissions(AuximRuntimeOptions? options)
     {
-        var logSink = new RuntimeLogEventSink(_homeDirectory());
+        if (options?.AllowedToolNames is not null)
+        {
+            throw new ArgumentException("AllowedToolNames is supported only by RunInContextAsync.", nameof(options));
+        }
+
+        if (options?.ResourcePermissions is not null)
+        {
+            throw new ArgumentException("ResourcePermissions is supported only by RunInContextAsync.", nameof(options));
+        }
+    }
+
+    private IRuntimeEventSink CreateEventSink(IRuntimeEventSink? frontendSink) =>
+        CreateEventSink(_homeDirectory(), frontendSink);
+
+    private static IRuntimeEventSink CreateEventSink(string homeDirectory, IRuntimeEventSink? frontendSink)
+    {
+        var logSink = new RuntimeLogEventSink(homeDirectory);
         return frontendSink is null
             ? logSink
             : new CompositeRuntimeEventSink(logSink, frontendSink);

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Auxim.Core.Resources;
 
 public sealed record ResourceAction(string Value)
@@ -87,4 +89,9 @@ public sealed record ResourceUri
 public sealed record ResourceAccess(
     ResourceAction Action,
     ResourceUri Resource,
-    bool RequiresApproval = false);
+    bool RequiresApproval = false)
+{
+    /// <summary>Indicates that the operation can access descendants of the declared resource.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IncludeDescendants { get; init; }
+}

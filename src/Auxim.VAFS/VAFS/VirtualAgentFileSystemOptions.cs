@@ -7,27 +7,39 @@ public sealed class VirtualAgentFileSystemOptions
     public string WorkspaceHostPath { get; init; } = Environment.CurrentDirectory;
     public string TmpHostPath { get; init; } = Path.Combine(GetAuximHome(), "tmp");
     public IReadOnlyList<VirtualMount> Mounts { get; init; } = [];
+    public bool AllowSharedTmpFallback { get; init; } = true;
 
     public static VirtualAgentFileSystemOptions FromEnvironment()
     {
         var config = LoadSandboxConfig();
-        var workspace = FirstNonEmpty(
-            Environment.GetEnvironmentVariable("AUXIM_WORKSPACE"),
-            config.Workspace,
-            Environment.CurrentDirectory);
         var tmp = FirstNonEmpty(
             Environment.GetEnvironmentVariable("AUXIM_TMP"),
             Path.Combine(GetAuximHome(), "tmp"));
 
-        return new VirtualAgentFileSystemOptions
-        {
-            WorkspaceHostPath = workspace,
-            TmpHostPath = tmp,
-            Mounts = MergeMounts(
-                config.Mounts.Select(ToVirtualMount),
-                ParseMounts(Environment.GetEnvironmentVariable("AUXIM_VAFS_MOUNTS"))),
-        };
+        return CaptureMounts(config.Workspace, config.Mounts.Select(ToVirtualMount), tmp, allowSharedTmpFallback: true);
     }
+
+    /// <summary>Captures environment overrides for supplied mounts and uses the supplied temporary path without fallback.</summary>
+    public static VirtualAgentFileSystemOptions CaptureMountsFromEnvironment(
+        string? configuredWorkspace,
+        IEnumerable<VirtualMount> configuredMounts,
+        string tmpHostPath) =>
+        CaptureMounts(configuredWorkspace, configuredMounts, tmpHostPath, allowSharedTmpFallback: false);
+
+    private static VirtualAgentFileSystemOptions CaptureMounts(
+        string? workspace,
+        IEnumerable<VirtualMount> mounts,
+        string tmpHostPath,
+        bool allowSharedTmpFallback) => new()
+    {
+        WorkspaceHostPath = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("AUXIM_WORKSPACE"), workspace, Environment.CurrentDirectory),
+        TmpHostPath = tmpHostPath,
+        Mounts = MergeMounts(
+            mounts,
+            ParseMounts(Environment.GetEnvironmentVariable("AUXIM_VAFS_MOUNTS"))),
+        AllowSharedTmpFallback = allowSharedTmpFallback,
+    };
 
     private static VirtualMount ToVirtualMount(SandboxMount mount)
     {

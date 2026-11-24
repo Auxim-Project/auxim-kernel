@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Auxim.Core.Approval;
 using Auxim.Core.Resources;
 
@@ -15,6 +16,16 @@ public abstract record RuntimeEvent(
     DateTimeOffset OccurredAt,
     AuximRunId RunId)
 {
+    /// <summary>The Kernel execution identity, when emitted by a context-bound run.</summary>
+    [JsonInclude]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public AuximExecutionId? ExecutionId { get; internal init; }
+
+    /// <summary>The immediate parent of a delegated execution.</summary>
+    [JsonInclude]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public AuximExecutionId? ParentExecutionId { get; internal init; }
+
     public abstract string Kind { get; }
 }
 
@@ -45,6 +56,11 @@ public sealed record RuntimeRunFailedEvent(
     string Error) : RuntimeEvent(EventId, OccurredAt, RunId)
 {
     public override string Kind => "run.failed";
+
+    /// <summary>Indicates that a context-bound run terminated in response to cancellation.</summary>
+    [JsonInclude]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsCanceled { get; internal init; }
 }
 
 public sealed record RuntimeContentDeltaEvent(

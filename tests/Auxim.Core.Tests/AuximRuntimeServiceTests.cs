@@ -188,13 +188,54 @@ public sealed class AuximRuntimeServiceTests : IDisposable
             "hello external");
 
         var first = await runtime.SendExternalMessageAsync(request);
-        var second = await runtime.SendExternalMessageAsync(request with { Text = "again" });
+        var second = await runtime.SendExternalMessageAsync(
+            request with { Text = "again" }, new AuximRuntimeOptions { AllowedToolNames = null });
         var conversation = Assert.Single(runtime.ListExternalConversations());
 
         Assert.Equal(first.ConversationKey, second.ConversationKey);
         Assert.Equal(first.SessionId, second.SessionId);
         Assert.Equal(first.SessionId, conversation.SessionId);
         Assert.Contains("hello external", first.FinalResponse);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task LegacyEntriesRejectNonNullPermissionsBeforeSideEffects(bool resourcePermissions, bool empty)
+    {
+        var runner = new FakeAgentRunner();
+        var runtime = new AuximRuntimeService(
+            runner,
+            new FakeRuntimeToolService(),
+            sessionStoreFactory: () => throw new InvalidOperationException("Sessions must not be opened."),
+            configLoader: () => throw new InvalidOperationException("Configuration must not be loaded."),
+            homeDirectory: () => throw new InvalidOperationException("The home directory must not be requested."));
+        var options = new AuximRuntimeOptions
+        {
+            AllowedToolNames = resourcePermissions ? null : empty ? [] : ["echo"],
+            ResourcePermissions = resourcePermissions ? empty ? [] : [new(ResourceAction.Read, "/workspace")] : null,
+            EventSink = new DelegateRuntimeEventSink((_, _) =>
+                throw new InvalidOperationException("Events must not be published.")),
+        };
+
+        await AssertRejected(() => runtime.ChatAsync(new AuximChatRequest("chat"), options));
+        await AssertRejected(() => runtime.InvokeToolAsync("echo",
+            new Dictionary<string, object?> { ["text"] = "hello" }, options));
+        await AssertRejected(() => runtime.SendExternalMessageAsync(
+            new AuximExternalMessageRequest("telegram", "group-1", "user-1", "hello"), options));
+
+        Assert.Null(runner.Request);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(_home));
+
+        async Task AssertRejected(Func<Task> invoke)
+        {
+            var error = await Assert.ThrowsAsync<ArgumentException>("options", invoke);
+            var option = resourcePermissions ? nameof(AuximRuntimeOptions.ResourcePermissions)
+                : nameof(AuximRuntimeOptions.AllowedToolNames);
+            Assert.Contains($"{option} is supported only by RunInContextAsync.", error.Message);
+        }
     }
 
     private AuximRuntimeService CreateRuntime(

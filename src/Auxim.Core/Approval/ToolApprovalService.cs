@@ -8,11 +8,17 @@ namespace Auxim.Core.Approval;
 public sealed class ToolApprovalService
 {
     private readonly string _storePath;
+    private readonly bool _allowRememberedGrants;
 
-    public ToolApprovalService(string? home = null)
+    public ToolApprovalService(string? home = null) : this(home, allowRememberedGrants: true)
+    {
+    }
+
+    internal ToolApprovalService(string? home, bool allowRememberedGrants)
     {
         home ??= ConfigLoader.GetAuximHome();
         _storePath = Path.Combine(home, "approvals.json");
+        _allowRememberedGrants = allowRememberedGrants;
     }
 
     public async Task<ApprovalResponse> ReviewAsync(
@@ -32,8 +38,8 @@ public sealed class ToolApprovalService
             return ApprovalResponse.Allow();
         }
 
-        var store = LoadStore();
-        if (IsGranted(store, toolName, protectedAccesses))
+        var store = _allowRememberedGrants ? LoadStore() : null;
+        if (store is not null && IsGranted(store, toolName, protectedAccesses))
         {
             return ApprovalResponse.Allow();
         }
@@ -43,7 +49,7 @@ public sealed class ToolApprovalService
             runId.Value,
             toolName,
             arguments,
-            protectedAccesses);
+            Array.AsReadOnly(protectedAccesses));
         await eventSink.PublishAsync(
             new RuntimeApprovalRequestedEvent(
                 RuntimeEventFactory.NewEventId(),
@@ -52,8 +58,15 @@ public sealed class ToolApprovalService
                 request),
             cancellationToken);
 
+        cancellationToken.ThrowIfCancellationRequested();
         var response = await approvalHandler.RequestAsync(request, cancellationToken);
-        if (response.Approved && response.Remember)
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!_allowRememberedGrants)
+        {
+            response = response with { Remember = false };
+        }
+
+        if (store is not null && response.Approved && response.Remember)
         {
             foreach (var access in protectedAccesses)
             {
