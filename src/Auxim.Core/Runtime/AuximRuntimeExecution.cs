@@ -9,10 +9,13 @@ public sealed partial class AuximRuntimeService
 {
     /// <summary>
     /// Runs an opted-in, trusted in-process runner in a Kernel-owned scope without a session.
-    /// The scope is closed and outstanding bound operations are drained before this call returns.
+    /// The scope is closed and outstanding bound operations are canceled and drained before this call returns.
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// The runner has not opted in, or the configured tool service cannot supply a bound catalog.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The runner returned normally with outstanding context operations.
     /// </exception>
     public async Task<AgentResult> RunInContextAsync(
         string userInput,
@@ -64,6 +67,7 @@ public sealed partial class AuximRuntimeService
         {
             AgentResult result;
             Exception? runFailure = null;
+            int outstandingOperations;
             try
             {
                 await context.EventSink.PublishAsync(
@@ -71,8 +75,9 @@ public sealed partial class AuximRuntimeService
                         RuntimeEventFactory.NewEventId(), RuntimeEventFactory.Now(), context.RunId, ""),
                     context.CancellationToken);
                 context.CancellationToken.ThrowIfCancellationRequested();
-                result = await _agentRunner.RunInContextAsync(userInput, context);
-                context.CancellationToken.ThrowIfCancellationRequested();
+                var runnerTask = _agentRunner.RunInContextAsync(userInput, context);
+                context.TrackRunnerTask(runnerTask);
+                result = await runnerTask;
             }
             catch (Exception exception)
             {
@@ -81,16 +86,17 @@ public sealed partial class AuximRuntimeService
             }
             finally
             {
+                var drained = context.BeginClose(out outstandingOperations);
                 try
                 {
-                    await context.CloseAsync(homeDirectory);
+                    await context.CloseAsync(homeDirectory, drained);
                 }
                 catch (Exception exception)
                 {
                     AuximLog.Warning(
                         $"Cleanup failed for execution {context.ExecutionId}: {exception.GetType().Name}: {exception.Message}",
                         homeDirectory);
-                    if (runFailure is null && !cancellationToken.IsCancellationRequested)
+                    if (runFailure is null && outstandingOperations == 0 && !cancellationToken.IsCancellationRequested)
                     {
                         throw;
                     }
@@ -98,6 +104,12 @@ public sealed partial class AuximRuntimeService
             }
 
             cancellationToken.ThrowIfCancellationRequested();
+            if (outstandingOperations != 0)
+            {
+                throw new InvalidOperationException(
+                    $"The runner returned with {outstandingOperations} outstanding context operation(s).");
+            }
+
             await context.EventSink.PublishAsync(
                 new RuntimeRunCompletedEvent(
                     RuntimeEventFactory.NewEventId(), RuntimeEventFactory.Now(), context.RunId, "", result.FinalResponse),

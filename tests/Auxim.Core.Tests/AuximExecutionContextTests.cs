@@ -198,9 +198,10 @@ public sealed class AuximExecutionContextTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ClosingRejectsNewWorkAndDrainsOutstandingToolsOnSuccessOrFailure(bool runnerFails)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task ClosingRejectsNewWorkAndDrainsOutstandingTools(bool runnerFails, bool callerCancels)
     {
         var stopping = NewSignal();
         var toolMayFinish = NewSignal();
@@ -214,42 +215,151 @@ public sealed class AuximExecutionContextTests : IDisposable
         }));
         AuximExecutionContext? capturedContext = null;
         Task<string>? outstandingTool = null;
+        var runnerFailure = new InvalidOperationException("runner failed");
         var runner = new ContextRunner((_, context) =>
         {
             capturedContext = context;
             outstandingTool = context.InvokeToolAsync("wait", NoArguments);
             return runnerFails
-                ? Task.FromException<AgentResult>(new InvalidOperationException("runner failed"))
+                ? Task.FromException<AgentResult>(runnerFailure)
                 : Task.FromResult(new AgentResult("done", []));
         });
         var runtime = CreateRuntime(runner, new RuntimeToolService(() => registry));
         var events = new ConcurrentQueue<RuntimeEvent>();
 
-        var run = runtime.RunInContextAsync("run", Options(events));
-        await stopping.Task.WaitAsync(TestTimeout);
-        Assert.NotNull(capturedContext);
-        Assert.NotNull(outstandingTool);
-        Assert.True(capturedContext.CancellationToken.IsCancellationRequested);
-        Assert.False(run.IsCompleted);
-        Assert.DoesNotContain(events, value => value is RuntimeRunCompletedEvent or RuntimeRunFailedEvent);
-        Assert.Throws<ObjectDisposedException>(() => capturedContext.ListTools());
-        Assert.Throws<ObjectDisposedException>(() => capturedContext.ResolveToolResourceAccesses("wait", NoArguments));
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => capturedContext.InvokeToolAsync("wait", NoArguments));
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => capturedContext.PublishContentDeltaAsync("late").AsTask());
-        toolMayFinish.SetResult();
+        using var cancellation = new CancellationTokenSource();
+        var run = runtime.RunInContextAsync("run", Options(events), cancellation.Token);
+        try
+        {
+            await stopping.Task.WaitAsync(TestTimeout);
+            Assert.NotNull(capturedContext);
+            Assert.True(capturedContext.CancellationToken.IsCancellationRequested);
+            Assert.False(run.IsCompleted);
+            Assert.DoesNotContain(events, value => value is RuntimeRunCompletedEvent or RuntimeRunFailedEvent);
+            var drain = capturedContext.BeginClose(out var outstanding);
+            Assert.Equal(1, outstanding);
+            Assert.False(drain.IsCompleted);
+            Assert.Same(drain, capturedContext.BeginClose(out var repeatedOutstanding));
+            Assert.Equal(outstanding, repeatedOutstanding);
+            Assert.Throws<ObjectDisposedException>(() => capturedContext.ListTools());
+            Assert.Throws<ObjectDisposedException>(() => capturedContext.ResolveToolResourceAccesses("wait", NoArguments));
+            await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+                capturedContext.InvokeToolAsync("wait", NoArguments).WaitAsync(TestTimeout));
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => capturedContext.PublishContentDeltaAsync("late").AsTask());
+            if (callerCancels)
+            {
+                cancellation.Cancel();
+            }
+        }
+        finally
+        {
+            toolMayFinish.TrySetResult();
+        }
 
+        Assert.NotNull(outstandingTool);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => outstandingTool.WaitAsync(TestTimeout));
+        Exception failure;
         if (runnerFails)
         {
-            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(TestTimeout));
-            Assert.Equal("runner failed", failure.Message);
-            Assert.IsType<RuntimeRunFailedEvent>(events.Last());
+            failure = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(TestTimeout));
+            Assert.Same(runnerFailure, failure);
+        }
+        else if (callerCancels)
+        {
+            var cancellationFailure = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(TestTimeout));
+            Assert.Equal(cancellation.Token, cancellationFailure.CancellationToken);
+            failure = cancellationFailure;
         }
         else
         {
-            Assert.Equal("done", (await run.WaitAsync(TestTimeout)).FinalResponse);
-            Assert.IsType<RuntimeRunCompletedEvent>(events.Last());
+            failure = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(TestTimeout));
+            Assert.Contains("1 outstanding context operation", failure.Message);
         }
+
+        Assert.Empty(events.OfType<RuntimeRunCompletedEvent>());
+        var failed = Assert.Single(events.OfType<RuntimeRunFailedEvent>());
+        Assert.Same(failed, events.Last());
+        Assert.Equal(failure.Message, failed.Error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletedRunnerTaskStopsAdmissionsBeforeRuntimeContinuation(bool toolFinishesBeforeLateAdmission)
+    {
+        var runnerResult = new TaskCompletionSource<AgentResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var toolMayFinish = NewSignal();
+        var registry = new ToolRegistry();
+        RegisterContextTool(registry, new ToolDefinition("wait", "test", "", async (_, _) =>
+        {
+            await toolMayFinish.Task;
+            return "done";
+        }));
+        AuximExecutionContext? capturedContext = null;
+        var runtime = CreateRuntime(new ContextRunner((_, context) =>
+        {
+            capturedContext = context;
+            return runnerResult.Task;
+        }), new RuntimeToolService(() => registry));
+        var scheduler = new PausedSynchronizationContext();
+        var previous = SynchronizationContext.Current;
+        Task<AgentResult> run;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(scheduler);
+            run = runtime.RunInContextAsync("run");
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+
+        Assert.NotNull(capturedContext);
+        var accepted = capturedContext.InvokeToolAsync("wait", NoArguments);
+        runnerResult.SetResult(new AgentResult("done", []));
+        var resume = await scheduler.Continuation.Task.WaitAsync(TestTimeout);
+        try
+        {
+            Assert.False(run.IsCompleted);
+            if (toolFinishesBeforeLateAdmission)
+            {
+                toolMayFinish.SetResult();
+                Assert.Equal("done", await accepted.WaitAsync(TestTimeout));
+            }
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+                capturedContext.InvokeToolAsync("wait", NoArguments).WaitAsync(TestTimeout));
+            toolMayFinish.TrySetResult();
+            Assert.Equal("done", await accepted.WaitAsync(TestTimeout));
+        }
+        finally
+        {
+            toolMayFinish.TrySetResult();
+            resume();
+        }
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(TestTimeout));
+        Assert.Contains("1 outstanding context operation", failure.Message);
+    }
+
+    [Fact]
+    public async Task RunnerCanCompleteAfterHandlingAToolFailure()
+    {
+        var registry = new ToolRegistry();
+        var toolFailure = new InvalidOperationException("tool failed");
+        RegisterContextTool(registry, new ToolDefinition("fail", "test", "", (_, _) => throw toolFailure));
+        var runtime = CreateRuntime(new ContextRunner(async (_, context) =>
+        {
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => context.InvokeToolAsync("fail", NoArguments));
+            Assert.Same(toolFailure, failure);
+            return new AgentResult("handled", []);
+        }), new RuntimeToolService(() => registry));
+        var events = new ConcurrentQueue<RuntimeEvent>();
+
+        Assert.Equal("handled", (await runtime.RunInContextAsync("run", Options(events))).FinalResponse);
+        Assert.Single(events.OfType<RuntimeToolCompletedEvent>());
+        Assert.Empty(events.OfType<RuntimeRunFailedEvent>());
+        Assert.IsType<RuntimeRunCompletedEvent>(events.Last());
     }
 
     [Fact]
@@ -722,6 +832,15 @@ public sealed class AuximExecutionContextTests : IDisposable
 
     private static void RegisterContextTool(ToolRegistry registry, ToolDefinition definition) =>
         registry.Register(definition with { ResourceViewBinder = _ => definition });
+
+    private sealed class PausedSynchronizationContext : SynchronizationContext
+    {
+        public TaskCompletionSource<Action> Continuation { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override void Post(SendOrPostCallback callback, object? state) =>
+            Continuation.SetResult(() => callback(state));
+    }
 
     private sealed class ContextRunner(Func<string, AuximExecutionContext, Task<AgentResult>> run) : IAgentRunner
     {

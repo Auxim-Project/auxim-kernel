@@ -437,8 +437,10 @@ public sealed class ExecutionResourceViewTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task ThrowingCloseCallbackDrainsAndCleansWithoutReplacingSuccessfulOutcome()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ThrowingCloseCallbackDoesNotChangeTheRunOutcome(bool leaveToolOutstanding)
     {
         var stopping = NewSignal();
         var release = NewSignal();
@@ -467,28 +469,62 @@ public sealed class ExecutionResourceViewTests : IDisposable
                 stopping.SetResult();
                 throw new InvalidOperationException("close callback failed");
             });
-            inFlight = context.InvokeToolAsync("test.hold", PathArgs("/tmp"));
+            if (leaveToolOutstanding)
+            {
+                inFlight = context.InvokeToolAsync("test.hold", PathArgs("/tmp"));
+            }
+
             return new AgentResult(input, []);
         }, registryFactory: () => registry);
-        var run = runtime.RunInContextAsync("done", CaptureEvents(events));
+
+        bool? tmpExistsAtTerminalEvent = null;
+        var run = runtime.RunInContextAsync("done", new AuximRuntimeOptions
+        {
+            EventSink = new DelegateRuntimeEventSink((value, _) =>
+            {
+                events.Enqueue(value);
+                if (value is RuntimeRunCompletedEvent or RuntimeRunFailedEvent)
+                {
+                    tmpExistsAtTerminalEvent = Directory.Exists(tmp);
+                }
+
+                return ValueTask.CompletedTask;
+            }),
+        });
         try
         {
             await stopping.Task.WaitAsync(WaitLimit);
-            Assert.True(Directory.Exists(tmp));
-            Assert.False(run.IsCompleted);
+            if (leaveToolOutstanding)
+            {
+                Assert.True(Directory.Exists(tmp));
+                Assert.False(run.IsCompleted);
+                Assert.DoesNotContain(events, value => value is RuntimeRunCompletedEvent or RuntimeRunFailedEvent);
+            }
         }
         finally
         {
             release.TrySetResult();
         }
 
-        Assert.NotNull(inFlight);
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => inFlight.WaitAsync(WaitLimit));
-        Assert.Equal("done", (await run.WaitAsync(WaitLimit)).FinalResponse);
+        if (leaveToolOutstanding)
+        {
+            Assert.NotNull(inFlight);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => inFlight.WaitAsync(WaitLimit));
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => run.WaitAsync(WaitLimit));
+            Assert.Contains("1 outstanding context operation", failure.Message);
+            Assert.Equal(failure.Message, Assert.Single(events.OfType<RuntimeRunFailedEvent>()).Error);
+            Assert.Empty(events.OfType<RuntimeRunCompletedEvent>());
+        }
+        else
+        {
+            Assert.Equal("done", (await run.WaitAsync(WaitLimit)).FinalResponse);
+            Assert.Single(events.OfType<RuntimeRunCompletedEvent>());
+            Assert.Empty(events.OfType<RuntimeRunFailedEvent>());
+        }
+
+        Assert.Equal(false, tmpExistsAtTerminalEvent);
         Assert.False(Directory.Exists(tmp));
         Assert.Throws<ObjectDisposedException>(() => contextToken.WaitHandle);
-        Assert.Single(events.OfType<RuntimeRunCompletedEvent>());
-        Assert.Empty(events.OfType<RuntimeRunFailedEvent>());
         Assert.Contains("close callback failed", ReadLog());
         Assert.Equal("next", (await runtime.RunInContextAsync("next")).FinalResponse);
         Assert.False(Directory.Exists(tmp));
@@ -662,6 +698,47 @@ public sealed class ExecutionResourceViewTests : IDisposable
         Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() => runtime.RunInContextAsync("fail")));
         Assert.NotNull(capturedTmp);
         Assert.False(Directory.Exists(capturedTmp));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OwnershipMarkerCreationFailurePreservesUnverifiedDirectory(bool replaceDirectory)
+    {
+        var failure = new UnauthorizedAccessException("could not create ownership marker");
+        var moved = Path.Combine(_root.FullName, "original-tmp");
+        string? tmp = null;
+        try
+        {
+            var thrown = Assert.Throws<UnauthorizedAccessException>(() => new ExecutionResourceView(
+                new SandboxConfig(), _home, followDirectoryLinksInListings: true,
+                createOwnershipMarker: markerPath =>
+                {
+                    tmp = Path.GetDirectoryName(markerPath)!;
+                    Assert.True(Directory.Exists(tmp));
+                    if (replaceDirectory)
+                    {
+                        Directory.Move(tmp, moved);
+                        Directory.CreateDirectory(tmp);
+                    }
+
+                    throw failure;
+                }));
+
+            Assert.Same(failure, thrown);
+            Assert.NotNull(tmp);
+            Assert.True(Directory.Exists(tmp));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(tmp));
+            Assert.Equal(replaceDirectory, Directory.Exists(moved));
+            Assert.Contains($"Setup cleanup skipped for '{tmp}' because ownership could not be established.", ReadLog());
+        }
+        finally
+        {
+            if (tmp is not null && Directory.Exists(tmp))
+            {
+                Directory.Delete(tmp, recursive: true);
+            }
+        }
     }
 
     private AuximRuntimeService CreateRuntime(

@@ -56,6 +56,17 @@ arguments captured for that invocation. Exceptions from nonterminal event
 callbacks propagate through the operation. Terminal events are delivered on a
 best-effort basis and delivery failures are logged.
 
+Runners must finish their accepted context operations before returning. Once
+the Kernel registers the returned runner task, admission and operation exit
+check for task completion under the same lock used to stop admission and
+record outstanding work. Operations may still be accepted before the runner
+returns its task and the Kernel registers it. The recorded count reflects when
+the Kernel first observes completion. Cancellation and cleanup may wait for
+the runtime continuation to resume. If operations were outstanding when the
+Kernel observed a normal runner return, it requests cancellation, drains the
+work, disposes the context's resources, and reports a run failure. A tool
+failure the runner handled can still result in a successful run.
+
 The existing chat and direct tool APIs serve legacy callers. The context entry
 point requires the Kernel's `RuntimeToolService` (or an empty tool catalog).
 Legacy runner and tool service implementations require an explicit upgrade to
@@ -70,11 +81,12 @@ name, including its read-only setting. The effective mount still governs file
 operations and approval requirements. The environment
 description and bound tools use that view for the lifetime of the context. The
 Kernel creates a unique `/tmp` under the system temporary directory, with no
-shared fallback or `AUXIM_TMP` override. It removes that directory on setup
-failure or after cancellation and admitted operations have finished on close.
+shared fallback or `AUXIM_TMP` override. It cleans up on setup failure or after
+cancellation and admitted operations have finished on close. If marker
+creation fails, the Kernel logs the directory path and leaves it in place.
 Cleanup verifies directory ownership before deleting recursively. A cleanup
-failure is logged and fails an otherwise successful run. A prior run failure
-or caller cancellation remains the primary outcome. Exceptions from
+failure is logged and fails an otherwise successful run. A runner failure,
+lifecycle violation, or caller cancellation remains the primary outcome. Exceptions from
 cancellation callbacks are logged while close continues to drain and clean up.
 Workspace and volume directories remain host-owned.
 

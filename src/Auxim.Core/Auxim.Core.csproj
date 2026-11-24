@@ -3,6 +3,7 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Auxim.Core.Tests" />
     <ProjectReference Include="..\Auxim.VAFS\Auxim.VAFS.csproj" />
   </ItemGroup>
 </Project>

@@ -27,8 +27,10 @@ public sealed class AuximExecutionContext
     private readonly CancellationTokenSource _lifetime;
     private readonly CancellationTokenRegistration _callerCancellation;
     private readonly object _gate = new();
+    private Task? _runnerTask;
     private bool _closed;
     private int _activeOperations;
+    private int _outstandingAtClose;
     private TaskCompletionSource? _drained;
     private Task? _cancellation;
 
@@ -178,21 +180,27 @@ public sealed class AuximExecutionContext
         }
     }
 
-    // Called once by the runtime, including on runner failure or cancellation.
-    internal async ValueTask CloseAsync(string homeDirectory)
+    internal void TrackRunnerTask(Task runnerTask)
     {
-        Task drained;
         lock (_gate)
         {
-            _closed = true;
-            if (_activeOperations != 0)
-            {
-                _drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            }
-
-            drained = _drained?.Task ?? Task.CompletedTask;
+            _runnerTask = runnerTask;
+            ObserveRunnerCompletion();
         }
+    }
 
+    internal Task BeginClose(out int outstandingOperations)
+    {
+        lock (_gate)
+        {
+            StopAcceptingOperations();
+            outstandingOperations = _outstandingAtClose;
+            return _drained?.Task ?? Task.CompletedTask;
+        }
+    }
+
+    internal async ValueTask CloseAsync(string homeDirectory, Task drained)
+    {
         try
         {
             await SignalCancellation();
@@ -238,6 +246,7 @@ public sealed class AuximExecutionContext
     {
         lock (_gate)
         {
+            ObserveRunnerCompletion();
             if (--_activeOperations == 0)
             {
                 _drained?.SetResult();
@@ -247,8 +256,33 @@ public sealed class AuximExecutionContext
 
     private void EnsureActive()
     {
+        ObserveRunnerCompletion();
         ObjectDisposedException.ThrowIf(_closed, this);
         CancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private void ObserveRunnerCompletion()
+    {
+        if (_runnerTask is { IsCompleted: true })
+        {
+            StopAcceptingOperations();
+        }
+    }
+
+    // Call under _gate so the initial count and drain task stay fixed across close requests.
+    private void StopAcceptingOperations()
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        _closed = true;
+        _outstandingAtClose = _activeOperations;
+        if (_outstandingAtClose != 0)
+        {
+            _drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
     }
 
     private static IReadOnlyDictionary<string, object?> SnapshotSchema(

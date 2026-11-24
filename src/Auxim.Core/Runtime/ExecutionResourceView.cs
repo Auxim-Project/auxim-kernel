@@ -9,14 +9,20 @@ internal sealed class ExecutionResourceView : IDisposable
     private readonly DirectoryInfo _temporaryDirectory;
     private readonly string _ownershipMarker = $".auxim-owner-{Guid.NewGuid():N}";
 
-    public ExecutionResourceView(SandboxConfig sandbox, string homeDirectory, bool followDirectoryLinksInListings)
+    public ExecutionResourceView(
+        SandboxConfig sandbox, string homeDirectory, bool followDirectoryLinksInListings,
+        Func<string, Stream>? createOwnershipMarker = null)
     {
         _temporaryDirectory = Directory.CreateTempSubdirectory("auxim-execution-");
+        var markerCreated = false;
         try
         {
-            using (new FileStream(Path.Combine(_temporaryDirectory.FullName, _ownershipMarker),
-                FileMode.CreateNew, FileAccess.Write))
+            var markerPath = Path.Combine(_temporaryDirectory.FullName, _ownershipMarker);
+            using (createOwnershipMarker is null
+                ? new FileStream(markerPath, FileMode.CreateNew, FileAccess.Write)
+                : createOwnershipMarker(markerPath))
             {
+                markerCreated = true;
             }
 
             var mounts = sandbox.Mounts.Select(mount => new VirtualMount(
@@ -26,7 +32,17 @@ internal sealed class ExecutionResourceView : IDisposable
         }
         catch
         {
-            DisposeAfterSetupFailure(homeDirectory);
+            if (markerCreated)
+            {
+                DisposeAfterSetupFailure(homeDirectory);
+            }
+            else
+            {
+                AuximLog.Warning(
+                    $"Setup cleanup skipped for '{_temporaryDirectory.FullName}' because ownership could not be established.",
+                    homeDirectory);
+            }
+
             throw;
         }
     }
